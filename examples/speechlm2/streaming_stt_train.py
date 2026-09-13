@@ -37,7 +37,7 @@ def _process_group_timeout(cfg):
     without this it keeps the c10d 10-minute default and a slow cold start aborts
     the run on a watchdog timeout no config value can raise.
     """
-    timeout_minutes = OmegaConf.select(cfg, "trainer.strategy.timeout_minutes", default=None)
+    timeout_minutes = OmegaConf.select(cfg, "nccl_timeout_minutes", default=None)
     if timeout_minutes is not None:
         return timedelta(minutes=float(timeout_minutes))
 

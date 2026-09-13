@@ -2695,41 +2695,6 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     embs_list.append(
                         self._embed_tokens(torch.tensor([last_gen_token[b]], device=device)).squeeze(0)  # (H,)
                     )
-                elif stream_state[b] == FLUSH:
-                    # The marker was fed on this step.
-                    #
-                    # Rungs 0 and 1 keep the per-chunk anchor on the flush turn, so hand
-                    # off to FOOTER: emission then triggers off exactly the position it
-                    # does at every other chunk boundary, reusing one well-trained
-                    # circuit instead of a second one seen once per utterance. Rung 2
-                    # has no anchor anywhere, so the flush logits ARE the answer.
-                    flushed[b] = True
-                    if not collapse_audio and uf_ah_ids:
-                        stream_state[b] = FOOTER
-                        template_pos[b] = 0
-                        continue
-                    first_token = self._sample_token(
-                        out.logits[b : b + 1, -1, :],
-                        None,
-                        generation_config,
-                        **generation_kwargs,
-                    ).item()
-                    first_is_stop = (
-                        self._eos_id is not None and first_token == self._eos_id
-                    ) or first_token == self.blank_token_id
-                    if first_is_stop:
-                        # The supervised "nothing left" case. Record the chunk separator
-                        # so decoding splits identically to every other chunk, then stop:
-                        # audio is exhausted by construction, so there is nothing to
-                        # return to.
-                        all_tokens[b].append(self.blank_token_id if self.has_blank else self._eos_id)
-                        stream_state[b] = DONE
-                    else:
-                        all_tokens[b].append(first_token)
-                        last_gen_token[b] = first_token
-                        gen_token_count[b] = 1
-                        stream_state[b] = GENERATING
-
                 elif stream_state[b] == BLANK_FEED:
                     # Only reached when has_blank is True (guarded at transition sites).
                     embs_list.append(
@@ -2748,6 +2713,14 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 else:  # DONE
                     embs_list.append(pad_emb)
 
+            # Every state branch above must contribute exactly one embedding. A branch
+            # that falls through without appending surfaces far downstream as an opaque
+            # KV-cache batch mismatch ("Expected size 64 but got size 63"), tens of
+            # frames from the actual cause, so check it here where the state is known.
+            assert len(embs_list) == B, (
+                f"embedding builder produced {len(embs_list)} embeddings for {B} streams -- "
+                f"a state branch failed to append (states this step: {sorted(set(stream_state))})"
+            )
             input_embs = torch.stack(embs_list).unsqueeze(1)  # (B, H) → (B, 1, H)
 
             # --- Single LLM forward ---
@@ -3150,6 +3123,41 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                         all_tokens[b].append(token)
                         last_gen_token[b] = token
                         gen_token_count[b] += 1
+
+                elif stream_state[b] == FLUSH:
+                    # The marker was fed on this step.
+                    #
+                    # Rungs 0 and 1 keep the per-chunk anchor on the flush turn, so hand
+                    # off to FOOTER: emission then triggers off exactly the position it
+                    # does at every other chunk boundary, reusing one well-trained
+                    # circuit instead of a second one seen once per utterance. Rung 2
+                    # has no anchor anywhere, so the flush logits ARE the answer.
+                    flushed[b] = True
+                    if not collapse_audio and uf_ah_ids:
+                        stream_state[b] = FOOTER
+                        template_pos[b] = 0
+                        continue
+                    first_token = self._sample_token(
+                        out.logits[b : b + 1, -1, :],
+                        None,
+                        generation_config,
+                        **generation_kwargs,
+                    ).item()
+                    first_is_stop = (
+                        self._eos_id is not None and first_token == self._eos_id
+                    ) or first_token == self.blank_token_id
+                    if first_is_stop:
+                        # The supervised "nothing left" case. Record the chunk separator
+                        # so decoding splits identically to every other chunk, then stop:
+                        # audio is exhausted by construction, so there is nothing to
+                        # return to.
+                        all_tokens[b].append(self.blank_token_id if self.has_blank else self._eos_id)
+                        stream_state[b] = DONE
+                    else:
+                        all_tokens[b].append(first_token)
+                        last_gen_token[b] = first_token
+                        gen_token_count[b] = 1
+                        stream_state[b] = GENERATING
 
                 elif stream_state[b] == BLANK_FEED:
                     # Blank was fed to LLM this step. Transition to ASST_FOOTER.
