@@ -1171,16 +1171,24 @@ class PEETransformerCTCTimestampExtractor:
             emissions. A value of one is the literal CTC-probability ×
             ``max(activity, epsilon)`` product; zero disables the soft gate.
         parallel_speaker_gate_threshold: Optional Sortformer threshold used to
-            select each speaker's CTC regions and hard-mask non-blank token
-            emissions below that probability in ``parallel`` mode. Long inactive
-            gaps become explicit word-boundary separators, so a word cannot be
-            aligned across another speaker's silence. Set ``None`` to use the
-            unrestricted CTC timeline.
+            select each speaker's padded CTC regions in ``parallel`` mode. Frames
+            outside those regions are excluded; the padded onset/offset collar
+            remains available to CTC token emissions and is weighted by the soft
+            Sortformer prior. Long inactive gaps become explicit word-boundary
+            separators. Set ``None`` to use the unrestricted CTC timeline.
         parallel_active_region_padding_seconds: Context added on both sides of a
-            selected Sortformer speech region; it provides blank-state context at
-            active-region boundaries before CTC alignment.
+            selected Sortformer speech region; it remains available for CTC
+            onset/offset evidence at active-region boundaries.
         parallel_active_region_merge_gap_seconds: Maximum remaining gap between
             padded active regions to merge. Longer gaps remain hard word boundaries.
+        coarse_alignment_band_size: Optional half-width, in blank-expanded CTC
+            target states, for a coarse-to-fine Viterbi search. When enabled, a
+            temporally coarsened first pass supplies a per-frame center state and
+            the fine pass evaluates only ``center - N`` through ``center + N``.
+            ``None`` (the default) preserves dense, exact Viterbi alignment.
+            This is an opt-in approximate accelerator: it falls back to dense DP
+            when the coarse path fails, the band is infeasible, or the recovered
+            path reaches an artificial band edge.
         alignment_mode: ``'serialized'`` (default) or ``'parallel'``.
         speaker_assignment_mode: ``'optimal'`` learns a per-audio one-to-one mapping
             from t-SOT tags to Sortformer columns using an initial CTC alignment;
@@ -1204,6 +1212,7 @@ class PEETransformerCTCTimestampExtractor:
         parallel_speaker_gate_threshold: Optional[float] = 0.5,
         parallel_active_region_padding_seconds: float = 0.16,
         parallel_active_region_merge_gap_seconds: float = 0.40,
+        coarse_alignment_band_size: Optional[int] = None,
         alignment_mode: str = 'serialized',
         speaker_assignment_mode: str = 'optimal',
         epsilon: float = 1.0e-6,
@@ -1224,6 +1233,7 @@ class PEETransformerCTCTimestampExtractor:
             raise ValueError("parallel_active_region_padding_seconds must be non-negative.")
         if parallel_active_region_merge_gap_seconds < 0:
             raise ValueError("parallel_active_region_merge_gap_seconds must be non-negative.")
+        coarse_alignment_band_size = self._normalize_coarse_alignment_band_size(coarse_alignment_band_size)
         if epsilon <= 0:
             raise ValueError("epsilon must be positive.")
 
@@ -1241,6 +1251,7 @@ class PEETransformerCTCTimestampExtractor:
         )
         self.parallel_active_region_padding_seconds = float(parallel_active_region_padding_seconds)
         self.parallel_active_region_merge_gap_seconds = float(parallel_active_region_merge_gap_seconds)
+        self.coarse_alignment_band_size = coarse_alignment_band_size
         self.alignment_mode = self._validate_alignment_mode(alignment_mode)
         self.speaker_assignment_mode = self._validate_assignment_mode(speaker_assignment_mode)
         self.epsilon = float(epsilon)
@@ -1249,32 +1260,41 @@ class PEETransformerCTCTimestampExtractor:
     def parse_sot_words(cls, sot_transcript: str) -> List[Dict[str, Any]]:
         """Parse a t-SOT transcript without sending speaker tags to the tokenizer.
 
-        A tag remains active until the next tag.  Text that precedes the first tag
-        is retained with ``speaker_tag=None`` rather than being silently assigned to
-        speaker zero.
+        A tag remains active until the next tag. Each tag occurrence also gets a
+        monotonically increasing ``turn_index`` so reappearing speakers retain their
+        original turn boundaries. Text that precedes the first tag is retained with
+        ``speaker_tag=None`` rather than being silently assigned to speaker zero.
         """
         if not isinstance(sot_transcript, str):
             raise TypeError(f"sot_transcript must be a string, got {type(sot_transcript).__name__}.")
 
         words: List[Dict[str, Any]] = []
         active_speaker: Optional[int] = None
+        # A t-SOT tag occurrence denotes a turn, even when a speaker tag
+        # reappears later. Keep that identity so parallel alignment can retain
+        # same-speaker turn order instead of flattening all of a speaker's text.
+        active_turn_index: Optional[int] = None
+        next_turn_index = 0
         cursor = 0
 
-        def append_words(text: str, speaker_tag: Optional[int]) -> None:
+        def append_words(text: str, speaker_tag: Optional[int], turn_index: Optional[int]) -> None:
             for word in re.findall(r"\S+", text):
                 words.append(
                     {
                         'word': word,
                         'speaker_tag': speaker_tag,
+                        'turn_index': turn_index,
                         'word_index': len(words),
                     }
                 )
 
         for match in cls._SPEAKER_TAG_RE.finditer(sot_transcript):
-            append_words(sot_transcript[cursor : match.start()], active_speaker)
+            append_words(sot_transcript[cursor : match.start()], active_speaker, active_turn_index)
             active_speaker = int(match.group(1))
+            active_turn_index = next_turn_index
+            next_turn_index += 1
             cursor = match.end()
-        append_words(sot_transcript[cursor:], active_speaker)
+        append_words(sot_transcript[cursor:], active_speaker, active_turn_index)
         return words
 
     def extract_ctc_and_sortformer(
@@ -1375,6 +1395,116 @@ class PEETransformerCTCTimestampExtractor:
             "sortformer_lengths": sortformer_lengths,
         }
 
+    def extract_ctc_and_sortformer_batch(
+        self,
+        processed_signal: torch.Tensor,
+        processed_signal_length: torch.Tensor,
+    ) -> Dict[str, Any]:
+        """Run the raw PEE experts and CTC head for a padded recording batch.
+
+        The model tensors retain their batch dimension.  Pass the returned
+        dictionary to :meth:`extract_from_outputs_batch` with one t-SOT
+        transcript per item; that method evaluates the alignment DPs in one
+        padded stream batch.  The single-record method remains unchanged for
+        backward compatibility.
+        """
+        if self.encoder is None:
+            raise ValueError("encoder is required to run PEE inference.")
+        if self.ctc_decoder is None:
+            raise ValueError("ctc_decoder is required to run PEE inference.")
+        if not isinstance(processed_signal, torch.Tensor) or processed_signal.ndim != 3:
+            raise ValueError("processed_signal must have shape (batch, features, frames).")
+        if not isinstance(processed_signal_length, torch.Tensor) or processed_signal_length.ndim != 1:
+            raise ValueError("processed_signal_length must have shape (batch,).")
+        if processed_signal.shape[0] == 0 or processed_signal_length.shape[0] != processed_signal.shape[0]:
+            raise ValueError("processed_signal and processed_signal_length must contain the same non-empty batch.")
+
+        pee_encoder = getattr(self.encoder, "encoder", self.encoder)
+        if not isinstance(pee_encoder, nn.Module):
+            raise TypeError(
+                "encoder must be a ParallelExpertEncoder or ParallelExpertEncoderPT wrapper; "
+                f"got {type(pee_encoder).__name__}."
+            )
+        if not hasattr(pee_encoder, "_run_asr") or not hasattr(pee_encoder, "_run_diarization"):
+            raise TypeError(
+                "PEETransformerCTCTimestampExtractor requires the two-branch "
+                "ParallelExpertEncoder API with _run_asr() and _run_diarization()."
+            )
+
+        modules: List[nn.Module] = [pee_encoder, self.ctc_decoder]
+        previous_modes = [(module, module.training) for module in modules]
+        try:
+            for module in modules:
+                module.eval()
+            with torch.inference_mode():
+                speech_states, speech_lengths = pee_encoder._run_asr(processed_signal, processed_signal_length)
+
+                # This is the existing PEE diarization inference path with its
+                # native embedding lengths retained.  PEE normally returns a
+                # padded Sortformer batch, so those lengths are essential to
+                # avoid resampling padded predictions for short recordings.
+                diar_signal = processed_signal
+                if pee_encoder.diar_normalize_type:
+                    diar_signal, _, _ = normalize_batch(
+                        diar_signal, processed_signal_length, normalize_type=pee_encoder.diar_normalize_type
+                    )
+                diar_signal = pee_encoder._match_module_io(diar_signal, pee_encoder.diarization_model)
+                diar_length = processed_signal_length.to(device=diar_signal.device)
+                embeddings, embedding_lengths = pee_encoder.diarization_model.frontend_encoder(
+                    processed_signal=diar_signal,
+                    processed_signal_length=diar_length,
+                    bypass_pre_encode=False,
+                )
+                native_predictions = pee_encoder.diarization_model.forward_infer(
+                    emb_seq=embeddings,
+                    emb_seq_length=embedding_lengths,
+                )
+                sortformer_sigmoids = pee_encoder._align_diarization_output_resolution(
+                    native_predictions, embedding_lengths
+                )
+                ctc_log_probs = self.ctc_decoder(speech_states, encoded_lengths=speech_lengths)
+        finally:
+            for module, was_training in previous_modes:
+                module.train(was_training)
+
+        if not isinstance(speech_states, torch.Tensor) or not isinstance(speech_lengths, torch.Tensor):
+            raise RuntimeError("PEE _run_asr() must return (states, lengths) tensors.")
+        if not isinstance(ctc_log_probs, torch.Tensor) or ctc_log_probs.ndim != 3:
+            raise RuntimeError("TransformerCTCDecoder must return (batch, frames, classes) log-probabilities.")
+        if not isinstance(sortformer_sigmoids, torch.Tensor) or sortformer_sigmoids.ndim != 3:
+            raise RuntimeError("PEE _run_diarization() must return (batch, frames, speakers) probabilities.")
+        if ctc_log_probs.shape[0] != processed_signal.shape[0] or sortformer_sigmoids.shape[0] != processed_signal.shape[0]:
+            raise RuntimeError("PEE expert branches and CTC head returned inconsistent batch sizes.")
+        if sortformer_sigmoids.shape[1] == 0:
+            raise RuntimeError("PEE _run_diarization() returned no Sortformer frames.")
+
+        speech_lengths = speech_lengths.detach().to(device=ctc_log_probs.device, dtype=torch.long)
+        embedding_lengths = embedding_lengths.detach().to(device=ctc_log_probs.device, dtype=torch.long)
+        if speech_lengths.ndim != 1 or speech_lengths.shape[0] != processed_signal.shape[0]:
+            raise RuntimeError("PEE _run_asr() returned invalid batch lengths.")
+        if (speech_lengths < 1).any() or (speech_lengths > ctc_log_probs.shape[1]).any():
+            raise RuntimeError("PEE _run_asr() returned lengths outside the CTC output time dimension.")
+
+        diar_model = pee_encoder.diarization_model
+        native_factor = 1 if diar_model.high_resolution else int(diar_model.encoder.subsampling_factor)
+        downsample_factor = int(diar_model.output_subsampling_factor) // native_factor
+        if downsample_factor <= 1:
+            sortformer_lengths = embedding_lengths
+        else:
+            native_lengths = embedding_lengths * (int(diar_model.encoder.subsampling_factor) // native_factor)
+            sortformer_lengths = torch.div(
+                native_lengths + downsample_factor - 1,
+                downsample_factor,
+                rounding_mode='floor',
+            )
+        sortformer_lengths = sortformer_lengths.clamp(min=1, max=sortformer_sigmoids.shape[1])
+        return {
+            "ctc_log_probs": ctc_log_probs,
+            "ctc_lengths": speech_lengths,
+            "sortformer_sigmoids": sortformer_sigmoids,
+            "sortformer_lengths": sortformer_lengths,
+        }
+
     def extract_from_audio(
         self,
         input_signal: torch.Tensor,
@@ -1421,6 +1551,67 @@ class PEETransformerCTCTimestampExtractor:
             **alignment_kwargs,
         )
 
+    def extract_from_audio_batch(
+        self,
+        input_signal: torch.Tensor,
+        input_signal_length: torch.Tensor,
+        preprocessor: nn.Module,
+        sot_transcripts: Sequence[str],
+        *,
+        audio_durations: Optional[Sequence[Optional[float]]] = None,
+        time_offsets: Optional[Sequence[float]] = None,
+        **alignment_kwargs: Any,
+    ) -> List[Dict[str, Any]]:
+        """Batch preprocess, PEE inference, and timestamp alignment.
+
+        ``input_signal`` is a padded waveform batch and ``sot_transcripts`` has
+        exactly one generated t-SOT transcript per waveform.  PEE runs once on
+        the waveform batch; :meth:`extract_from_outputs_batch` then flattens
+        every serialized or per-speaker stream across recordings into one padded
+        Viterbi batch.
+        """
+        if not isinstance(preprocessor, nn.Module):
+            raise TypeError(f"preprocessor must be an nn.Module, got {type(preprocessor).__name__}.")
+        if not isinstance(input_signal, torch.Tensor) or input_signal.ndim < 2:
+            raise ValueError("input_signal must have a leading batch dimension and waveform samples.")
+        if not isinstance(input_signal_length, torch.Tensor) or input_signal_length.ndim != 1:
+            raise ValueError("input_signal_length must have shape (batch,).")
+        batch_size = input_signal.shape[0]
+        if batch_size == 0 or input_signal_length.shape[0] != batch_size:
+            raise ValueError("input_signal and input_signal_length must contain the same non-empty batch.")
+        self._validate_sot_transcripts(sot_transcripts, batch_size)
+
+        was_training = preprocessor.training
+        try:
+            preprocessor.eval()
+            with torch.inference_mode():
+                preprocessor_result = preprocessor(input_signal=input_signal, length=input_signal_length)
+        finally:
+            preprocessor.train(was_training)
+        if not isinstance(preprocessor_result, tuple) or len(preprocessor_result) != 2:
+            raise RuntimeError("preprocessor must return (processed_signal, processed_signal_length).")
+        processed_signal, processed_signal_length = preprocessor_result
+        model_outputs = self.extract_ctc_and_sortformer_batch(processed_signal, processed_signal_length)
+
+        if audio_durations is None:
+            sample_rate = getattr(preprocessor, '_sample_rate', getattr(preprocessor, 'sample_rate', None))
+            if sample_rate is not None:
+                input_lengths = self._select_batch_lengths(
+                    input_signal_length,
+                    batch_size,
+                    input_signal.shape[-1],
+                    'input_signal_length',
+                )
+                audio_durations = [length / float(sample_rate) for length in input_lengths]
+
+        return self.extract_from_outputs_batch(
+            sot_transcripts=sot_transcripts,
+            audio_durations=audio_durations,
+            time_offsets=time_offsets,
+            **model_outputs,
+            **alignment_kwargs,
+        )
+
     def extract_from_outputs(
         self,
         ctc_log_probs: torch.Tensor,
@@ -1456,9 +1647,8 @@ class PEETransformerCTCTimestampExtractor:
                 Sortformer-column mapping override.
             speaker_logprob_weight: Per-call Sortformer DP-prior weight override.
             parallel_speaker_gate_threshold: Per-call Sortformer threshold that
-                selects active CTC regions and hard-masks non-blank token states.
-                Omit it to use the extractor default; pass ``None`` to align the
-                unrestricted CTC timeline for this call.
+                selects padded active CTC regions. Omit it to use the extractor
+                default; pass ``None`` to align the unrestricted CTC timeline.
 
         Returns:
             A dictionary whose ``speaker_word_timestamps`` contains one ordered list
@@ -1532,10 +1722,17 @@ class PEETransformerCTCTimestampExtractor:
             ctc_step_seconds,
         )
 
+        parsed_sot_words = self.parse_sot_words(sot_transcript)
         tokenized_words = self._tokenize_words(
-            self.parse_sot_words(sot_transcript),
+            parsed_sot_words,
             blank_id,
             alignment_mode=mode,
+        )
+        needs_parallel_turn_fences = mode == 'parallel' and self._has_repeated_speaker_turns(tokenized_words)
+        serialized_turn_anchor_words = (
+            self._tokenize_words(parsed_sot_words, blank_id, alignment_mode='serialized')
+            if needs_parallel_turn_fences
+            else None
         )
         speaker_tags = self._speaker_tags_in_order(tokenized_words)
         if not tokenized_words:
@@ -1550,15 +1747,18 @@ class PEETransformerCTCTimestampExtractor:
                 'num_ctc_frames': ctc_length,
                 'num_sortformer_frames': sortformer_length,
                 'ctc_log_normalizer_error': ctc_log_normalizer_error,
-                'alignment_diagnostics': {},
+                'alignment_diagnostics': {
+                    'coarse_alignment_band_size': self.coarse_alignment_band_size,
+                },
             }
 
         # Learn the t-SOT-tag-to-Sortformer-column mapping from pure CTC paths.
         # In parallel mode these preliminary paths are also independent, avoiding
         # any artificial ordering constraint for overlapping speaker transcripts.
         preliminary_scores: Dict[Optional[int], float] = {}
+        preliminary_coarse_diagnostics: Dict[Optional[int], Dict[str, Any]] = {}
         if mode == 'serialized':
-            preliminary_rows, preliminary_score = self._align_word_sequence(
+            preliminary_rows, preliminary_score, preliminary_coarse_diagnostic = self._align_word_sequence(
                 tokenized_words=tokenized_words,
                 ctc_log_probs=ctc,
                 blank_id=blank_id,
@@ -1567,10 +1767,16 @@ class PEETransformerCTCTimestampExtractor:
                 ctc_step_seconds=ctc_step_seconds,
                 time_offset=time_offset,
                 speaker_logprob_weight=0.0,
+                use_coarse_alignment=False,
             )
             preliminary_scores[None] = preliminary_score
+            preliminary_coarse_diagnostics[None] = preliminary_coarse_diagnostic
         else:
-            preliminary_rows, preliminary_scores = self._align_parallel_word_streams_batched(
+            (
+                preliminary_rows,
+                preliminary_scores,
+                preliminary_coarse_diagnostics,
+            ) = self._align_parallel_word_streams_batched(
                 tokenized_words=tokenized_words,
                 ctc_log_probs=ctc,
                 blank_id=blank_id,
@@ -1580,6 +1786,31 @@ class PEETransformerCTCTimestampExtractor:
                 time_offset=time_offset,
                 speaker_logprob_weight=0.0,
                 speaker_gate_threshold=None,
+                use_coarse_alignment=False,
+            )
+
+        parallel_turn_word_bounds: Dict[int, Tuple[int, int]] = {}
+        parallel_turn_diagnostics: Dict[Optional[int], List[Dict[str, Any]]] = {}
+        serialized_turn_anchor_score: Optional[float] = None
+        serialized_turn_anchor_coarse_diagnostic: Optional[Dict[str, Any]] = None
+        if serialized_turn_anchor_words is not None:
+            serialized_turn_anchor_rows, serialized_turn_anchor_score, serialized_turn_anchor_coarse_diagnostic = (
+                self._align_word_sequence(
+                    tokenized_words=serialized_turn_anchor_words,
+                    ctc_log_probs=ctc,
+                    blank_id=blank_id,
+                    speaker_probs=None,
+                    speaker_mapping={},
+                    ctc_step_seconds=ctc_step_seconds,
+                    time_offset=time_offset,
+                    speaker_logprob_weight=0.0,
+                    use_coarse_alignment=False,
+                )
+            )
+            parallel_turn_word_bounds, parallel_turn_diagnostics = self._build_parallel_turn_frame_bounds(
+                tokenized_words=tokenized_words,
+                serialized_anchor_rows=serialized_turn_anchor_rows,
+                ctc_num_frames=ctc.shape[0],
             )
 
         speaker_mapping, assignment_scores = self._resolve_speaker_mapping(
@@ -1590,9 +1821,10 @@ class PEETransformerCTCTimestampExtractor:
         )
 
         alignment_scores: Dict[Optional[int], float] = {}
+        final_coarse_diagnostics: Dict[Optional[int], Dict[str, Any]] = {}
         parallel_active_region_diagnostics: Dict[Optional[int], Dict[str, Any]] = {}
         if mode == 'serialized':
-            rows, path_score = self._align_word_sequence(
+            rows, path_score, final_coarse_diagnostic = self._align_word_sequence(
                 tokenized_words=tokenized_words,
                 ctc_log_probs=ctc,
                 blank_id=blank_id,
@@ -1604,6 +1836,7 @@ class PEETransformerCTCTimestampExtractor:
                 speaker_gate_threshold=None,
             )
             alignment_scores[None] = path_score
+            final_coarse_diagnostics[None] = final_coarse_diagnostic
         else:
             parallel_timelines, parallel_active_region_diagnostics = self._build_parallel_active_timelines(
                 tokenized_words=tokenized_words,
@@ -1613,7 +1846,7 @@ class PEETransformerCTCTimestampExtractor:
                 ctc_step_seconds=ctc_step_seconds,
                 active_threshold=parallel_gate_threshold,
             )
-            rows, alignment_scores = self._align_parallel_word_streams_batched(
+            rows, alignment_scores, final_coarse_diagnostics = self._align_parallel_word_streams_batched(
                 tokenized_words=tokenized_words,
                 ctc_log_probs=ctc,
                 blank_id=blank_id,
@@ -1622,10 +1855,14 @@ class PEETransformerCTCTimestampExtractor:
                 ctc_step_seconds=ctc_step_seconds,
                 time_offset=time_offset,
                 speaker_logprob_weight=float(speaker_weight),
-                # Keep token emissions inside the measured speech regions. The
-                # padded collar supplies blank-state context, not extra speech.
-                speaker_gate_threshold=parallel_gate_threshold,
+                # The compact timeline excludes frames outside the padded
+                # Sortformer-active regions. Do not hard-mask token emissions
+                # again inside its collar: genuine onset/offset phones can fall
+                # just below the activity threshold, while the soft prior and
+                # t-SOT turn fences still constrain the path.
+                speaker_gate_threshold=None,
                 speaker_timelines=parallel_timelines,
+                word_source_frame_bounds=parallel_turn_word_bounds or None,
             )
 
         speaker_word_timestamps: Dict[Optional[int], List[Dict[str, Any]]] = {}
@@ -1651,6 +1888,650 @@ class PEETransformerCTCTimestampExtractor:
                 'parallel_active_regions': parallel_active_region_diagnostics if mode == 'parallel' else {},
                 'parallel_active_region_padding_seconds': self.parallel_active_region_padding_seconds,
                 'parallel_active_region_merge_gap_seconds': self.parallel_active_region_merge_gap_seconds,
+                'parallel_turn_fences': parallel_turn_diagnostics if mode == 'parallel' else {},
+                'parallel_turn_anchor_path_score': serialized_turn_anchor_score,
+                'parallel_turn_anchor_coarse_alignment': serialized_turn_anchor_coarse_diagnostic,
+                'coarse_alignment_band_size': self.coarse_alignment_band_size,
+                # Speaker-column assignment must remain globally exact: a narrow
+                # coarse-to-fine path can alter the evidence used by that mapping.
+                'preliminary_forced_dense_for_speaker_mapping': self.coarse_alignment_band_size is not None,
+                'coarse_alignment': {
+                    'preliminary': preliminary_coarse_diagnostics,
+                    'final': final_coarse_diagnostics,
+                },
+            },
+        }
+
+    def extract_from_outputs_batch(
+        self,
+        ctc_log_probs: torch.Tensor,
+        sortformer_sigmoids: Optional[torch.Tensor],
+        sot_transcripts: Sequence[str],
+        *,
+        ctc_lengths: Optional[torch.Tensor] = None,
+        sortformer_lengths: Optional[torch.Tensor] = None,
+        audio_durations: Optional[Sequence[Optional[float]]] = None,
+        time_offsets: Optional[Sequence[float]] = None,
+        alignment_mode: Optional[str] = None,
+        speaker_assignment_mode: Optional[str] = None,
+        speaker_logprob_weight: Optional[float] = None,
+        parallel_speaker_gate_threshold: Any = _UNSET_PARALLEL_SPEAKER_GATE,
+    ) -> List[Dict[str, Any]]:
+        """Force-align a padded batch of independent t-SOT recordings together.
+
+        Unlike a Python loop over :meth:`extract_from_outputs`, this method
+        concatenates the valid CTC grids into a private global grid, flattens
+        every record's serialized target or independent speaker target into one
+        padded stream collection, and executes batched preliminary and final
+        Viterbi passes. When a speaker has multiple t-SOT turns, one additional
+        batched serialized CTC-only anchor pass provides same-speaker turn fences.
+        Per-stream source-frame indices retain record-local ownership, so no path
+        can cross between recordings.
+
+        Args mirror :meth:`extract_from_outputs`, except tensor inputs carry a
+        leading batch dimension and sequence arguments contain one entry per
+        recording.  Record lengths are required whenever the model tensors are
+        padded.  The returned list preserves input batch order.
+        """
+        if not isinstance(ctc_log_probs, torch.Tensor) or ctc_log_probs.ndim != 3:
+            raise ValueError("ctc_log_probs must have shape (batch, frames, classes).")
+        batch_size, max_ctc_frames, ctc_vocab_size = ctc_log_probs.shape
+        if batch_size == 0 or max_ctc_frames == 0 or ctc_vocab_size < 2:
+            raise ValueError("ctc_log_probs must contain a non-empty batch, time grid, and CTC vocabulary.")
+        self._validate_sot_transcripts(sot_transcripts, batch_size)
+        mode = self._validate_alignment_mode(alignment_mode or self.alignment_mode)
+        assignment_mode = self._validate_assignment_mode(
+            speaker_assignment_mode or self.speaker_assignment_mode
+        )
+        speaker_weight = self.speaker_logprob_weight if speaker_logprob_weight is None else speaker_logprob_weight
+        if speaker_weight < 0:
+            raise ValueError("speaker_logprob_weight must be non-negative.")
+        parallel_gate_threshold = (
+            self.parallel_speaker_gate_threshold
+            if parallel_speaker_gate_threshold is _UNSET_PARALLEL_SPEAKER_GATE
+            else parallel_speaker_gate_threshold
+        )
+        if parallel_gate_threshold is not None and not 0.0 <= float(parallel_gate_threshold) <= 1.0:
+            raise ValueError("parallel_speaker_gate_threshold must be between zero and one or None.")
+
+        ctc_lengths_list = self._select_batch_lengths(
+            ctc_lengths, batch_size, max_ctc_frames, 'ctc_lengths'
+        )
+        blank_id = self._resolve_blank_id(ctc_vocab_size)
+        ctc_cpu = ctc_log_probs.detach().to(device='cpu', dtype=torch.float32)
+
+        sortformer_cpu: Optional[torch.Tensor] = None
+        sortformer_lengths_list: List[Optional[int]]
+        if sortformer_sigmoids is None:
+            sortformer_lengths_list = [None] * batch_size
+        else:
+            if not isinstance(sortformer_sigmoids, torch.Tensor) or sortformer_sigmoids.ndim != 3:
+                raise ValueError("sortformer_sigmoids must have shape (batch, frames, speakers).")
+            if sortformer_sigmoids.shape[0] != batch_size or sortformer_sigmoids.shape[1] == 0:
+                raise ValueError("sortformer_sigmoids must have the same non-empty batch and time dimensions.")
+            if sortformer_sigmoids.shape[2] == 0:
+                raise ValueError("sortformer_sigmoids must contain at least one speaker column.")
+            sortformer_lengths_list = [
+                int(length)
+                for length in self._select_batch_lengths(
+                    sortformer_lengths,
+                    batch_size,
+                    int(sortformer_sigmoids.shape[1]),
+                    'sortformer_lengths',
+                )
+            ]
+            sortformer_cpu = sortformer_sigmoids.detach().to(device='cpu', dtype=torch.float32)
+
+        audio_duration_list = self._select_optional_float_sequence(
+            audio_durations, batch_size, 'audio_durations'
+        )
+        time_offset_list = self._select_float_sequence(time_offsets, batch_size, 'time_offsets', default=0.0)
+
+        records: List[Dict[str, Any]] = []
+        for record_index in range(batch_size):
+            ctc_length = ctc_lengths_list[record_index]
+            ctc = ctc_cpu[record_index, :ctc_length]
+            if torch.isnan(ctc).any():
+                raise ValueError(f"ctc_log_probs[{record_index}] contains NaN values.")
+            ctc_log_normalizer_error = float(torch.logsumexp(ctc, dim=-1).abs().max().item())
+            if ctc_log_normalizer_error > 0.05:
+                raise ValueError(
+                    f"ctc_log_probs[{record_index}] does not appear to be log-softmax output: maximum "
+                    f"log-normalization error is {ctc_log_normalizer_error:.4f}."
+                )
+
+            sortformer: Optional[torch.Tensor] = None
+            sortformer_on_ctc: Optional[torch.Tensor] = None
+            sortformer_length: Optional[int] = None
+            if sortformer_cpu is not None:
+                sortformer_length = sortformer_lengths_list[record_index]
+                assert sortformer_length is not None
+                sortformer = sortformer_cpu[record_index, :sortformer_length]
+                if torch.isnan(sortformer).any():
+                    raise ValueError(f"sortformer_sigmoids[{record_index}] contains NaN values.")
+                if float(sortformer.min().item()) < -1.0e-3 or float(sortformer.max().item()) > 1.001:
+                    raise ValueError(f"sortformer_sigmoids[{record_index}] must contain sigmoid probabilities in [0, 1].")
+                sortformer_on_ctc = self._resample_speaker_probs(sortformer.clamp(min=0.0, max=1.0), ctc_length)
+
+            audio_duration = audio_duration_list[record_index]
+            if audio_duration is not None and audio_duration <= 0:
+                raise ValueError(f"audio_durations[{record_index}] must be positive, got {audio_duration}.")
+            time_offset = time_offset_list[record_index]
+            ctc_step_seconds = self._resolve_ctc_frame_seconds(ctc_length, audio_duration)
+            sortformer_step_seconds = self._resolve_sortformer_frame_seconds(
+                sortformer_length,
+                audio_duration,
+                ctc_step_seconds,
+            )
+            parsed_sot_words = self.parse_sot_words(sot_transcripts[record_index])
+            tokenized_words = self._tokenize_words(
+                parsed_sot_words,
+                blank_id,
+                alignment_mode=mode,
+            )
+            needs_parallel_turn_fences = mode == 'parallel' and self._has_repeated_speaker_turns(tokenized_words)
+            serialized_turn_anchor_words = (
+                self._tokenize_words(parsed_sot_words, blank_id, alignment_mode='serialized')
+                if needs_parallel_turn_fences
+                else None
+            )
+            records.append(
+                {
+                    'record_index': record_index,
+                    'ctc': ctc,
+                    'sortformer_on_ctc': sortformer_on_ctc,
+                    'sortformer_length': sortformer_length,
+                    'ctc_step_seconds': ctc_step_seconds,
+                    'sortformer_step_seconds': sortformer_step_seconds,
+                    'time_offset': time_offset,
+                    'ctc_log_normalizer_error': ctc_log_normalizer_error,
+                    'tokenized_words': tokenized_words,
+                    'serialized_turn_anchor_words': serialized_turn_anchor_words,
+                    'parallel_turn_word_bounds': {},
+                    'parallel_turn_diagnostics': {},
+                    'serialized_turn_anchor_score': None,
+                    'serialized_turn_anchor_coarse_diagnostic': None,
+                    'speaker_tags': self._speaker_tags_in_order(tokenized_words),
+                }
+            )
+
+        # No active streams are needed for empty transcripts, but retain the
+        # same result schema as the single-record public method.
+        results: List[Optional[Dict[str, Any]]] = [None] * batch_size
+        active_records = [record for record in records if record['tokenized_words']]
+        for record in records:
+            if record['tokenized_words']:
+                continue
+            results[record['record_index']] = self._build_batched_alignment_result(
+                record=record,
+                alignment_mode=mode,
+                speaker_assignment_mode=assignment_mode,
+                speaker_mapping={},
+                rows=[],
+                preliminary_scores={},
+                final_scores={},
+                assignment_scores={},
+                preliminary_coarse_diagnostics={},
+                final_coarse_diagnostics={},
+                parallel_active_region_diagnostics={},
+                parallel_gate_threshold=parallel_gate_threshold,
+            )
+        if not active_records:
+            return [result for result in results if result is not None]
+
+        # Each global CTC-frame index belongs to exactly one record.  The stream
+        # DP accepts arbitrary source-frame indices, so this retains one shared
+        # padded trellis without changing the existing per-record row formatter.
+        ctc_offset = 0
+        global_ctc_parts: List[torch.Tensor] = []
+        global_speaker_parts: List[torch.Tensor] = []
+        for record in active_records:
+            record['ctc_offset'] = ctc_offset
+            ctc_offset += int(record['ctc'].shape[0])
+            global_ctc_parts.append(record['ctc'])
+            if sortformer_cpu is not None:
+                speaker_probs = record['sortformer_on_ctc']
+                if speaker_probs is None:
+                    raise RuntimeError("Batch Sortformer packing lost a recording's speaker probabilities.")
+                global_speaker_parts.append(speaker_probs)
+        global_ctc = torch.cat(global_ctc_parts, dim=0)
+        global_speaker_probs = torch.cat(global_speaker_parts, dim=0) if global_speaker_parts else None
+
+        preliminary_streams: List[Dict[str, Any]] = []
+        for record in active_records:
+            if mode == 'serialized':
+                stream_groups = [(None, record['tokenized_words'])]
+            else:
+                stream_groups = list(self._group_words_by_speaker(record['tokenized_words']).items())
+            for stream_key, stream_words in stream_groups:
+                num_frames = int(record['ctc'].shape[0])
+                preliminary_streams.append(
+                    self._build_batched_record_stream(
+                        record=record,
+                        stream_key=stream_key,
+                        tokenized_words=stream_words,
+                        blank_id=blank_id,
+                        speaker_mapping={},
+                        source_frame_indices=torch.arange(num_frames, dtype=torch.long),
+                        active_region_ids=torch.zeros(num_frames, dtype=torch.long),
+                    )
+                )
+        preliminary_alignment = self._align_record_streams_batched(
+            streams=preliminary_streams,
+            ctc_log_probs=global_ctc,
+            speaker_probs=None,
+            blank_id=blank_id,
+            speaker_logprob_weight=0.0,
+            speaker_gate_threshold=None,
+            use_coarse_alignment=False,
+        )
+
+        preliminary_rows: Dict[int, List[Dict[str, Any]]] = {
+            int(record['record_index']): [] for record in active_records
+        }
+        preliminary_scores: Dict[int, Dict[Optional[int], float]] = {
+            int(record['record_index']): {} for record in active_records
+        }
+        preliminary_coarse_diagnostics: Dict[int, Dict[Optional[int], Dict[str, Any]]] = {
+            int(record['record_index']): {} for record in active_records
+        }
+        for aligned in preliminary_alignment:
+            stream = aligned['stream']
+            record = stream['record']
+            record_index = int(record['record_index'])
+            preliminary_rows[record_index].extend(
+                self._word_rows_from_path(
+                    tokenized_words=stream['tokenized_words'],
+                    labels=stream['labels'],
+                    state_to_word=stream['state_to_word'],
+                    path=aligned['path'],
+                    ctc_log_probs=record['ctc'],
+                    speaker_probs=None,
+                    speaker_mapping={},
+                    ctc_step_seconds=record['ctc_step_seconds'],
+                    time_offset=record['time_offset'],
+                    source_frame_indices=stream['source_frame_indices'],
+                    active_region_ids=stream['active_region_ids'],
+                )
+            )
+            preliminary_scores[record_index][stream['stream_key']] = aligned['score']
+            preliminary_coarse_diagnostics[record_index][stream['stream_key']] = aligned['diagnostic']
+
+        # A separate serialized CTC-only guide retains the original t-SOT turn
+        # order. Its same-speaker midpoints become per-token source-frame fences
+        # for the final parallel streams. All guides share one padded DP batch.
+        serialized_turn_anchor_streams: List[Dict[str, Any]] = []
+        for record in active_records:
+            anchor_words = record['serialized_turn_anchor_words']
+            if anchor_words is None:
+                continue
+            num_frames = int(record['ctc'].shape[0])
+            serialized_turn_anchor_streams.append(
+                self._build_batched_record_stream(
+                    record=record,
+                    stream_key=None,
+                    tokenized_words=anchor_words,
+                    blank_id=blank_id,
+                    speaker_mapping={},
+                    source_frame_indices=torch.arange(num_frames, dtype=torch.long),
+                    active_region_ids=torch.zeros(num_frames, dtype=torch.long),
+                )
+            )
+        if serialized_turn_anchor_streams:
+            serialized_turn_anchor_alignment = self._align_record_streams_batched(
+                streams=serialized_turn_anchor_streams,
+                ctc_log_probs=global_ctc,
+                speaker_probs=None,
+                blank_id=blank_id,
+                speaker_logprob_weight=0.0,
+                speaker_gate_threshold=None,
+                use_coarse_alignment=False,
+            )
+            for aligned in serialized_turn_anchor_alignment:
+                stream = aligned['stream']
+                record = stream['record']
+                anchor_rows = self._word_rows_from_path(
+                    tokenized_words=stream['tokenized_words'],
+                    labels=stream['labels'],
+                    state_to_word=stream['state_to_word'],
+                    path=aligned['path'],
+                    ctc_log_probs=record['ctc'],
+                    speaker_probs=None,
+                    speaker_mapping={},
+                    ctc_step_seconds=record['ctc_step_seconds'],
+                    time_offset=record['time_offset'],
+                    source_frame_indices=stream['source_frame_indices'],
+                    active_region_ids=stream['active_region_ids'],
+                )
+                bounds, diagnostics = self._build_parallel_turn_frame_bounds(
+                    tokenized_words=record['tokenized_words'],
+                    serialized_anchor_rows=anchor_rows,
+                    ctc_num_frames=int(record['ctc'].shape[0]),
+                )
+                record['parallel_turn_word_bounds'] = bounds
+                record['parallel_turn_diagnostics'] = diagnostics
+                record['serialized_turn_anchor_score'] = aligned['score']
+                record['serialized_turn_anchor_coarse_diagnostic'] = aligned['diagnostic']
+
+        for record in active_records:
+            record_index = int(record['record_index'])
+            speaker_mapping, assignment_scores = self._resolve_speaker_mapping(
+                speaker_tags=record['speaker_tags'],
+                preliminary_rows=preliminary_rows[record_index],
+                speaker_probs=record['sortformer_on_ctc'],
+                assignment_mode=assignment_mode,
+            )
+            record['speaker_mapping'] = speaker_mapping
+            record['assignment_scores'] = assignment_scores
+
+        final_streams: List[Dict[str, Any]] = []
+        parallel_active_region_diagnostics: Dict[int, Dict[Optional[int], Dict[str, Any]]] = {
+            int(record['record_index']): {} for record in active_records
+        }
+        for record in active_records:
+            if mode == 'serialized':
+                num_frames = int(record['ctc'].shape[0])
+                final_streams.append(
+                    self._build_batched_record_stream(
+                        record=record,
+                        stream_key=None,
+                        tokenized_words=record['tokenized_words'],
+                        blank_id=blank_id,
+                        speaker_mapping=record['speaker_mapping'],
+                        source_frame_indices=torch.arange(num_frames, dtype=torch.long),
+                        active_region_ids=torch.zeros(num_frames, dtype=torch.long),
+                    )
+                )
+                continue
+
+            timelines, diagnostics = self._build_parallel_active_timelines(
+                tokenized_words=record['tokenized_words'],
+                speaker_mapping=record['speaker_mapping'],
+                speaker_probs=record['sortformer_on_ctc'],
+                ctc_num_frames=int(record['ctc'].shape[0]),
+                ctc_step_seconds=record['ctc_step_seconds'],
+                active_threshold=parallel_gate_threshold,
+            )
+            record_index = int(record['record_index'])
+            parallel_active_region_diagnostics[record_index] = diagnostics
+            for stream_key, stream_words in self._group_words_by_speaker(record['tokenized_words']).items():
+                timeline = timelines[stream_key]
+                final_streams.append(
+                    self._build_batched_record_stream(
+                        record=record,
+                        stream_key=stream_key,
+                        tokenized_words=stream_words,
+                        blank_id=blank_id,
+                        speaker_mapping=record['speaker_mapping'],
+                        source_frame_indices=timeline['source_frame_indices'],
+                        active_region_ids=timeline['region_ids'],
+                        word_source_frame_bounds=record['parallel_turn_word_bounds'] or None,
+                    )
+                )
+
+        final_alignment = self._align_record_streams_batched(
+            streams=final_streams,
+            ctc_log_probs=global_ctc,
+            speaker_probs=global_speaker_probs,
+            blank_id=blank_id,
+            speaker_logprob_weight=float(speaker_weight),
+            # The parallel timeline itself is the hard active-region selection.
+            # Keep its padded collar available for CTC onset/offset tokens.
+            speaker_gate_threshold=None,
+            use_coarse_alignment=True,
+        )
+        final_rows: Dict[int, List[Dict[str, Any]]] = {
+            int(record['record_index']): [] for record in active_records
+        }
+        final_scores: Dict[int, Dict[Optional[int], float]] = {
+            int(record['record_index']): {} for record in active_records
+        }
+        final_coarse_diagnostics: Dict[int, Dict[Optional[int], Dict[str, Any]]] = {
+            int(record['record_index']): {} for record in active_records
+        }
+        for aligned in final_alignment:
+            stream = aligned['stream']
+            record = stream['record']
+            record_index = int(record['record_index'])
+            final_rows[record_index].extend(
+                self._word_rows_from_path(
+                    tokenized_words=stream['tokenized_words'],
+                    labels=stream['labels'],
+                    state_to_word=stream['state_to_word'],
+                    path=aligned['path'],
+                    ctc_log_probs=record['ctc'],
+                    speaker_probs=record['sortformer_on_ctc'],
+                    speaker_mapping=record['speaker_mapping'],
+                    ctc_step_seconds=record['ctc_step_seconds'],
+                    time_offset=record['time_offset'],
+                    source_frame_indices=stream['source_frame_indices'],
+                    active_region_ids=stream['active_region_ids'],
+                )
+            )
+            final_scores[record_index][stream['stream_key']] = aligned['score']
+            final_coarse_diagnostics[record_index][stream['stream_key']] = aligned['diagnostic']
+
+        for record in active_records:
+            record_index = int(record['record_index'])
+            results[record_index] = self._build_batched_alignment_result(
+                record=record,
+                alignment_mode=mode,
+                speaker_assignment_mode=assignment_mode,
+                speaker_mapping=record['speaker_mapping'],
+                rows=final_rows[record_index],
+                preliminary_scores=preliminary_scores[record_index],
+                final_scores=final_scores[record_index],
+                assignment_scores=record['assignment_scores'],
+                preliminary_coarse_diagnostics=preliminary_coarse_diagnostics[record_index],
+                final_coarse_diagnostics=final_coarse_diagnostics[record_index],
+                parallel_active_region_diagnostics=parallel_active_region_diagnostics[record_index],
+                parallel_gate_threshold=parallel_gate_threshold,
+            )
+        if any(result is None for result in results):
+            raise RuntimeError("Batch timestamp alignment did not produce one result per input record.")
+        return [result for result in results if result is not None]
+
+    def _build_batched_record_stream(
+        self,
+        *,
+        record: Dict[str, Any],
+        stream_key: Optional[int],
+        tokenized_words: Sequence[Dict[str, Any]],
+        blank_id: int,
+        speaker_mapping: Mapping[Optional[int], Optional[int]],
+        source_frame_indices: torch.Tensor,
+        active_region_ids: torch.Tensor,
+        word_source_frame_bounds: Optional[Mapping[int, Tuple[int, int]]] = None,
+    ) -> Dict[str, Any]:
+        """Build one globally addressable CTC stream for a batch-recording DP."""
+        labels, state_to_word, flat_tokens = self._build_ctc_target(tokenized_words, blank_id)
+        source_frame_indices = source_frame_indices.detach().to(device='cpu', dtype=torch.long)
+        active_region_ids = active_region_ids.detach().to(device='cpu', dtype=torch.long)
+        if source_frame_indices.ndim != 1 or active_region_ids.ndim != 1:
+            raise ValueError("Batch stream timeline tensors must be one-dimensional.")
+        if source_frame_indices.numel() == 0 or source_frame_indices.shape != active_region_ids.shape:
+            raise ValueError("Batch stream timeline is empty or has mismatched region IDs.")
+        num_ctc_frames = int(record['ctc'].shape[0])
+        invalid_source = (source_frame_indices < -1) | (source_frame_indices >= num_ctc_frames)
+        invalid_region = ((source_frame_indices < 0) & (active_region_ids != -1)) | (
+            (source_frame_indices >= 0) & (active_region_ids < 0)
+        )
+        if invalid_source.any() or invalid_region.any():
+            raise ValueError("Batch stream timeline contains an invalid CTC frame or region ID.")
+        if source_frame_indices[0] < 0 or source_frame_indices[-1] < 0:
+            raise ValueError("Each compact CTC timeline must begin and end on an acoustic frame.")
+        actual_frame_count = int((source_frame_indices >= 0).sum().item())
+        minimum_frames = self._minimum_ctc_frames(flat_tokens)
+        if minimum_frames > actual_frame_count:
+            raise ValueError(
+                "CTC target is infeasible in selected active regions for batch record "
+                f"{record['record_index']}, stream {stream_key!r}: it needs at least {minimum_frames} acoustic "
+                f"CTC frames but only {actual_frame_count} are available. Lower the active-region threshold, "
+                "increase the region padding or merge gap, or use serialized alignment."
+            )
+
+        state_speaker_columns: List[Optional[int]] = [None] * len(labels)
+        for state_index, local_word_index in enumerate(state_to_word):
+            if local_word_index is not None:
+                state_speaker_columns[state_index] = speaker_mapping.get(
+                    tokenized_words[local_word_index]['speaker_tag']
+                )
+        separator_state_mask = torch.tensor(
+            [
+                label == blank_id
+                and (
+                    state_index == 0
+                    or state_index == len(labels) - 1
+                    or state_to_word[state_index - 1] != state_to_word[state_index + 1]
+                )
+                for state_index, label in enumerate(labels)
+            ],
+            dtype=torch.bool,
+        )
+        state_min_source_frames, state_max_source_frames = self._state_source_frame_bounds(
+            tokenized_words=tokenized_words,
+            state_to_word=state_to_word,
+            word_source_frame_bounds=word_source_frame_bounds,
+            local_ctc_num_frames=num_ctc_frames,
+            source_frame_offset=int(record['ctc_offset']),
+        )
+        global_source_frame_indices = source_frame_indices.clone()
+        acoustic_frames = global_source_frame_indices >= 0
+        global_source_frame_indices[acoustic_frames] += int(record['ctc_offset'])
+        return {
+            'record': record,
+            'stream_key': stream_key,
+            'tokenized_words': list(tokenized_words),
+            'labels': labels,
+            'state_to_word': state_to_word,
+            'state_speaker_columns': state_speaker_columns,
+            'state_min_source_frames': state_min_source_frames,
+            'state_max_source_frames': state_max_source_frames,
+            'source_frame_indices': source_frame_indices,
+            'global_source_frame_indices': global_source_frame_indices,
+            'active_region_ids': active_region_ids,
+            'separator_state_mask': separator_state_mask,
+        }
+
+    def _align_record_streams_batched(
+        self,
+        *,
+        streams: Sequence[Dict[str, Any]],
+        ctc_log_probs: torch.Tensor,
+        speaker_probs: Optional[torch.Tensor],
+        blank_id: int,
+        speaker_logprob_weight: float,
+        speaker_gate_threshold: Optional[float],
+        use_coarse_alignment: bool,
+    ) -> List[Dict[str, Any]]:
+        """Pack independent record streams and run one padded CTC Viterbi call."""
+        if not streams:
+            return []
+        num_streams = len(streams)
+        max_states = max(len(stream['labels']) for stream in streams)
+        max_time = max(int(stream['global_source_frame_indices'].numel()) for stream in streams)
+        state_lengths = torch.tensor([len(stream['labels']) for stream in streams], dtype=torch.long)
+        time_lengths = torch.tensor(
+            [int(stream['global_source_frame_indices'].numel()) for stream in streams], dtype=torch.long
+        )
+        labels_batch = torch.full((num_streams, max_states), blank_id, dtype=torch.long)
+        columns_batch = torch.full((num_streams, max_states), -1, dtype=torch.long)
+        state_min_frames_batch = torch.zeros((num_streams, max_states), dtype=torch.long)
+        state_max_frames_batch = torch.full(
+            (num_streams, max_states), ctc_log_probs.shape[0] - 1, dtype=torch.long
+        )
+        source_frames_batch = torch.full((num_streams, max_time), -1, dtype=torch.long)
+        separator_states_batch = torch.zeros((num_streams, max_states), dtype=torch.bool)
+        for stream_index, stream in enumerate(streams):
+            labels = stream['labels']
+            columns = stream['state_speaker_columns']
+            source_frame_indices = stream['global_source_frame_indices']
+            labels_batch[stream_index, : len(labels)] = torch.tensor(labels, dtype=torch.long)
+            columns_batch[stream_index, : len(columns)] = torch.tensor(
+                [-1 if column is None else int(column) for column in columns], dtype=torch.long
+            )
+            state_min_frames_batch[stream_index, : len(labels)] = torch.tensor(
+                stream['state_min_source_frames'], dtype=torch.long
+            )
+            state_max_frames_batch[stream_index, : len(labels)] = torch.tensor(
+                stream['state_max_source_frames'], dtype=torch.long
+            )
+            source_frames_batch[stream_index, : source_frame_indices.numel()] = source_frame_indices
+            separator_states_batch[stream_index, : len(labels)] = stream['separator_state_mask']
+
+        paths, scores, diagnostics = self._ctc_viterbi_align_batched(
+            ctc_log_probs=ctc_log_probs,
+            labels=labels_batch,
+            state_lengths=state_lengths,
+            blank_id=blank_id,
+            state_speaker_columns=columns_batch,
+            speaker_probs=speaker_probs,
+            speaker_logprob_weight=speaker_logprob_weight,
+            speaker_gate_threshold=speaker_gate_threshold,
+            source_frame_indices=source_frames_batch,
+            time_lengths=time_lengths,
+            separator_state_mask=separator_states_batch,
+            state_min_source_frames=state_min_frames_batch,
+            state_max_source_frames=state_max_frames_batch,
+            use_coarse_alignment=use_coarse_alignment,
+        )
+        return [
+            {'stream': stream, 'path': path, 'score': score, 'diagnostic': diagnostic}
+            for stream, path, score, diagnostic in zip(streams, paths, scores, diagnostics)
+        ]
+
+    def _build_batched_alignment_result(
+        self,
+        *,
+        record: Mapping[str, Any],
+        alignment_mode: str,
+        speaker_assignment_mode: str,
+        speaker_mapping: Dict[int, Optional[int]],
+        rows: Sequence[Dict[str, Any]],
+        preliminary_scores: Mapping[Optional[int], float],
+        final_scores: Mapping[Optional[int], float],
+        assignment_scores: Mapping[int, List[float]],
+        preliminary_coarse_diagnostics: Mapping[Optional[int], Dict[str, Any]],
+        final_coarse_diagnostics: Mapping[Optional[int], Dict[str, Any]],
+        parallel_active_region_diagnostics: Mapping[Optional[int], Dict[str, Any]],
+        parallel_gate_threshold: Optional[float],
+    ) -> Dict[str, Any]:
+        """Format one record from a globally batched alignment run."""
+        speaker_word_timestamps: Dict[Optional[int], List[Dict[str, Any]]] = {}
+        for row in rows:
+            speaker_word_timestamps.setdefault(row['speaker_tag'], []).append(row)
+        return {
+            'speaker_word_timestamps': speaker_word_timestamps,
+            'speaker_tag_to_sortformer_column': speaker_mapping,
+            'alignment_mode': alignment_mode,
+            'speaker_assignment_mode': speaker_assignment_mode,
+            'ctc_frame_seconds': record['ctc_step_seconds'],
+            'sortformer_frame_seconds': record['sortformer_step_seconds'],
+            'time_offset': record['time_offset'],
+            'num_ctc_frames': int(record['ctc'].shape[0]),
+            'num_sortformer_frames': record['sortformer_length'],
+            'ctc_log_normalizer_error': record['ctc_log_normalizer_error'],
+            'alignment_diagnostics': {
+                'preliminary_ctc_path_scores': dict(preliminary_scores),
+                'final_path_scores': dict(final_scores),
+                'speaker_assignment_scores': dict(assignment_scores),
+                'parallel_speaker_gate_threshold': parallel_gate_threshold if alignment_mode == 'parallel' else None,
+                'parallel_active_regions': (
+                    dict(parallel_active_region_diagnostics) if alignment_mode == 'parallel' else {}
+                ),
+                'parallel_active_region_padding_seconds': self.parallel_active_region_padding_seconds,
+                'parallel_active_region_merge_gap_seconds': self.parallel_active_region_merge_gap_seconds,
+                'parallel_turn_fences': (
+                    dict(record.get('parallel_turn_diagnostics', {})) if alignment_mode == 'parallel' else {}
+                ),
+                'parallel_turn_anchor_path_score': record.get('serialized_turn_anchor_score'),
+                'parallel_turn_anchor_coarse_alignment': record.get('serialized_turn_anchor_coarse_diagnostic'),
+                'coarse_alignment_band_size': self.coarse_alignment_band_size,
+                'preliminary_forced_dense_for_speaker_mapping': self.coarse_alignment_band_size is not None,
+                'coarse_alignment': {
+                    'preliminary': dict(preliminary_coarse_diagnostics),
+                    'final': dict(final_coarse_diagnostics),
+                },
             },
         }
 
@@ -1820,6 +2701,164 @@ class PEETransformerCTCTimestampExtractor:
         return grouped
 
     @staticmethod
+    def _has_repeated_speaker_turns(tokenized_words: Sequence[Dict[str, Any]]) -> bool:
+        """Return whether any explicit t-SOT speaker has more than one turn."""
+        turns_by_speaker: Dict[Optional[int], set[int]] = {}
+        for word in tokenized_words:
+            turn_index = word.get('turn_index')
+            if turn_index is None:
+                continue
+            if isinstance(turn_index, bool) or not isinstance(turn_index, int):
+                raise TypeError("turn_index must be an integer or None.")
+            turns = turns_by_speaker.setdefault(word['speaker_tag'], set())
+            turns.add(turn_index)
+            if len(turns) > 1:
+                return True
+        return False
+
+    @staticmethod
+    def _build_parallel_turn_frame_bounds(
+        *,
+        tokenized_words: Sequence[Dict[str, Any]],
+        serialized_anchor_rows: Sequence[Dict[str, Any]],
+        ctc_num_frames: int,
+    ) -> Tuple[Dict[int, Tuple[int, int]], Dict[Optional[int], List[Dict[str, Any]]]]:
+        """Build same-speaker t-SOT turn fences from a serialized CTC anchor.
+
+        The serialized anchor preserves global t-SOT order. For each speaker, a
+        midpoint between consecutive occurrences of that speaker becomes a hard
+        source-frame fence for the token states in the adjacent turns. Different
+        speakers intentionally retain independent, potentially overlapping windows.
+        """
+        if ctc_num_frames <= 0:
+            raise ValueError("ctc_num_frames must be positive.")
+
+        anchor_by_word_index: Dict[int, Dict[str, Any]] = {}
+        for row in serialized_anchor_rows:
+            try:
+                word_index = int(row['word_index'])
+                start_frame = int(row['start_frame'])
+                end_frame = int(row['end_frame'])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError("Serialized turn-anchor rows must carry integer word and frame indices.") from error
+            if not 0 <= start_frame <= end_frame < ctc_num_frames:
+                raise ValueError("Serialized turn-anchor row has a frame outside the CTC timeline.")
+            if word_index in anchor_by_word_index:
+                raise ValueError(f"Serialized turn-anchor has duplicate word_index {word_index}.")
+            anchor_by_word_index[word_index] = row
+
+        turns_by_speaker: Dict[Optional[int], List[Dict[str, Any]]] = {}
+        seen_word_indices: set[int] = set()
+        for word in tokenized_words:
+            try:
+                word_index = int(word['word_index'])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError("Tokenized words must carry integer word_index values.") from error
+            if word_index in seen_word_indices:
+                raise ValueError(f"Tokenized words have duplicate word_index {word_index}.")
+            seen_word_indices.add(word_index)
+            if word_index not in anchor_by_word_index:
+                raise ValueError(f"Serialized turn-anchor omitted word_index {word_index}.")
+
+            turn_index = word.get('turn_index')
+            if turn_index is not None and (isinstance(turn_index, bool) or not isinstance(turn_index, int)):
+                raise TypeError("turn_index must be an integer or None.")
+            speaker_turns = turns_by_speaker.setdefault(word['speaker_tag'], [])
+            if not speaker_turns or speaker_turns[-1]['turn_index'] != turn_index:
+                speaker_turns.append({'turn_index': turn_index, 'words': []})
+            speaker_turns[-1]['words'].append(word)
+
+        if len(anchor_by_word_index) != len(seen_word_indices):
+            unexpected = sorted(set(anchor_by_word_index).difference(seen_word_indices))
+            raise ValueError(f"Serialized turn-anchor has unknown word_index values: {unexpected}.")
+
+        bounds_by_word_index: Dict[int, Tuple[int, int]] = {}
+        diagnostics: Dict[Optional[int], List[Dict[str, Any]]] = {}
+        for speaker_tag, turns in turns_by_speaker.items():
+            if len(turns) <= 1:
+                continue
+            previous_anchor_start = -1
+            for turn in turns:
+                anchor_rows = [anchor_by_word_index[int(word['word_index'])] for word in turn['words']]
+                anchor_start = min(int(row['start_frame']) for row in anchor_rows)
+                anchor_end = max(int(row['end_frame']) for row in anchor_rows)
+                if anchor_start < previous_anchor_start:
+                    raise ValueError(
+                        "Serialized turn-anchor is not monotonic within a speaker; cannot create turn fences."
+                    )
+                turn['anchor_start_frame'] = anchor_start
+                turn['anchor_end_frame'] = anchor_end
+                previous_anchor_start = anchor_start
+
+            lower = 0
+            speaker_diagnostics: List[Dict[str, Any]] = []
+            for turn_index, turn in enumerate(turns):
+                if turn_index + 1 == len(turns):
+                    upper = ctc_num_frames - 1
+                else:
+                    next_turn = turns[turn_index + 1]
+                    upper = (int(turn['anchor_end_frame']) + int(next_turn['anchor_start_frame'])) // 2
+                    upper = min(ctc_num_frames - 1, max(lower, upper))
+                if upper < lower:
+                    raise RuntimeError("Parallel turn fence construction produced an empty CTC interval.")
+                bounds = (lower, upper)
+                for word in turn['words']:
+                    bounds_by_word_index[int(word['word_index'])] = bounds
+                speaker_diagnostics.append(
+                    {
+                        'turn_index': turn['turn_index'],
+                        'first_word_index': int(turn['words'][0]['word_index']),
+                        'last_word_index': int(turn['words'][-1]['word_index']),
+                        'anchor_start_frame': int(turn['anchor_start_frame']),
+                        'anchor_end_frame': int(turn['anchor_end_frame']),
+                        'min_source_frame': lower,
+                        'max_source_frame': upper,
+                    }
+                )
+                lower = upper + 1
+            diagnostics[speaker_tag] = speaker_diagnostics
+        return bounds_by_word_index, diagnostics
+
+    @staticmethod
+    def _state_source_frame_bounds(
+        *,
+        tokenized_words: Sequence[Dict[str, Any]],
+        state_to_word: Sequence[Optional[int]],
+        word_source_frame_bounds: Optional[Mapping[int, Tuple[int, int]]],
+        local_ctc_num_frames: int,
+        source_frame_offset: int = 0,
+    ) -> Tuple[List[int], List[int]]:
+        """Return inclusive source-frame bounds for token states in one target."""
+        if local_ctc_num_frames <= 0:
+            raise ValueError("local_ctc_num_frames must be positive.")
+        default_min = int(source_frame_offset)
+        default_max = default_min + int(local_ctc_num_frames) - 1
+        state_min_frames = [default_min] * len(state_to_word)
+        state_max_frames = [default_max] * len(state_to_word)
+        if word_source_frame_bounds is None:
+            return state_min_frames, state_max_frames
+
+        for state_index, local_word_index in enumerate(state_to_word):
+            if local_word_index is None:
+                continue
+            word = tokenized_words[local_word_index]
+            word_index = int(word['word_index'])
+            bounds = word_source_frame_bounds.get(word_index)
+            if bounds is None:
+                continue
+            if not isinstance(bounds, tuple) or len(bounds) != 2:
+                raise TypeError("word_source_frame_bounds values must be (min_frame, max_frame) tuples.")
+            lower, upper = int(bounds[0]), int(bounds[1])
+            if not 0 <= lower <= upper < local_ctc_num_frames:
+                raise ValueError(
+                    f"Turn frame bounds [{lower}, {upper}] for word_index {word_index} are outside "
+                    f"the local CTC grid [0, {local_ctc_num_frames - 1}]."
+                )
+            state_min_frames[state_index] = lower + int(source_frame_offset)
+            state_max_frames[state_index] = upper + int(source_frame_offset)
+        return state_min_frames, state_max_frames
+
+    @staticmethod
     def _build_ctc_target(
         tokenized_words: Sequence[Dict[str, Any]],
         blank_id: int,
@@ -1974,7 +3013,8 @@ class PEETransformerCTCTimestampExtractor:
         time_offset: float,
         speaker_logprob_weight: float,
         speaker_gate_threshold: Optional[float] = None,
-    ) -> Tuple[List[Dict[str, Any]], float]:
+        use_coarse_alignment: bool = True,
+    ) -> Tuple[List[Dict[str, Any]], float, Dict[str, Any]]:
         labels, state_to_word, flat_tokens = self._build_ctc_target(tokenized_words, blank_id)
         minimum_frames = self._minimum_ctc_frames(flat_tokens)
         if minimum_frames > ctc_log_probs.shape[0]:
@@ -1991,7 +3031,7 @@ class PEETransformerCTCTimestampExtractor:
             speaker_tag = tokenized_words[local_word_index]['speaker_tag']
             state_speaker_columns[state_index] = speaker_mapping.get(speaker_tag)
 
-        path, path_score = self._ctc_viterbi_align(
+        path, path_score, coarse_diagnostic = self._ctc_viterbi_align(
             ctc_log_probs=ctc_log_probs,
             labels=labels,
             blank_id=blank_id,
@@ -1999,6 +3039,7 @@ class PEETransformerCTCTimestampExtractor:
             speaker_probs=speaker_probs,
             speaker_logprob_weight=speaker_logprob_weight,
             speaker_gate_threshold=speaker_gate_threshold,
+            use_coarse_alignment=use_coarse_alignment,
         )
         rows = self._word_rows_from_path(
             tokenized_words=tokenized_words,
@@ -2011,7 +3052,7 @@ class PEETransformerCTCTimestampExtractor:
             ctc_step_seconds=ctc_step_seconds,
             time_offset=time_offset,
         )
-        return rows, path_score
+        return rows, path_score, coarse_diagnostic
 
     def _align_parallel_word_streams_batched(
         self,
@@ -2026,7 +3067,9 @@ class PEETransformerCTCTimestampExtractor:
         speaker_logprob_weight: float,
         speaker_gate_threshold: Optional[float],
         speaker_timelines: Optional[Mapping[Optional[int], Mapping[str, torch.Tensor]]] = None,
-    ) -> Tuple[List[Dict[str, Any]], Dict[Optional[int], float]]:
+        word_source_frame_bounds: Optional[Mapping[int, Tuple[int, int]]] = None,
+        use_coarse_alignment: bool = True,
+    ) -> Tuple[List[Dict[str, Any]], Dict[Optional[int], float], Dict[Optional[int], Dict[str, Any]]]:
         """Align independent speaker streams in one padded CTC Viterbi batch.
 
         Each stream can provide a compact timeline containing original CTC frames
@@ -2095,6 +3138,12 @@ class PEETransformerCTCTimestampExtractor:
                 ],
                 dtype=torch.bool,
             )
+            state_min_source_frames, state_max_source_frames = self._state_source_frame_bounds(
+                tokenized_words=speaker_words,
+                state_to_word=state_to_word,
+                word_source_frame_bounds=word_source_frame_bounds,
+                local_ctc_num_frames=ctc_log_probs.shape[0],
+            )
             streams.append(
                 {
                     'speaker_tag': speaker_tag,
@@ -2102,6 +3151,8 @@ class PEETransformerCTCTimestampExtractor:
                     'labels': labels,
                     'state_to_word': state_to_word,
                     'state_speaker_columns': state_speaker_columns,
+                    'state_min_source_frames': state_min_source_frames,
+                    'state_max_source_frames': state_max_source_frames,
                     'source_frame_indices': source_frame_indices,
                     'active_region_ids': active_region_ids,
                     'separator_state_mask': separator_state_mask,
@@ -2109,7 +3160,7 @@ class PEETransformerCTCTimestampExtractor:
             )
 
         if not streams:
-            return [], {}
+            return [], {}, {}
 
         num_streams = len(streams)
         max_states = max(len(stream['labels']) for stream in streams)
@@ -2120,6 +3171,10 @@ class PEETransformerCTCTimestampExtractor:
         )
         labels_batch = torch.full((num_streams, max_states), blank_id, dtype=torch.long)
         columns_batch = torch.full((num_streams, max_states), -1, dtype=torch.long)
+        state_min_frames_batch = torch.zeros((num_streams, max_states), dtype=torch.long)
+        state_max_frames_batch = torch.full(
+            (num_streams, max_states), ctc_log_probs.shape[0] - 1, dtype=torch.long
+        )
         source_frames_batch = torch.full((num_streams, max_time), -1, dtype=torch.long)
         separator_states_batch = torch.zeros((num_streams, max_states), dtype=torch.bool)
         for stream_index, stream in enumerate(streams):
@@ -2130,10 +3185,16 @@ class PEETransformerCTCTimestampExtractor:
             columns_batch[stream_index, : len(columns)] = torch.tensor(
                 [-1 if column is None else int(column) for column in columns], dtype=torch.long
             )
+            state_min_frames_batch[stream_index, : len(labels)] = torch.tensor(
+                stream['state_min_source_frames'], dtype=torch.long
+            )
+            state_max_frames_batch[stream_index, : len(labels)] = torch.tensor(
+                stream['state_max_source_frames'], dtype=torch.long
+            )
             source_frames_batch[stream_index, : source_frame_indices.numel()] = source_frame_indices
             separator_states_batch[stream_index, : len(labels)] = stream['separator_state_mask']
 
-        paths, scores = self._ctc_viterbi_align_batched(
+        paths, scores, coarse_diagnostics = self._ctc_viterbi_align_batched(
             ctc_log_probs=ctc_log_probs,
             labels=labels_batch,
             state_lengths=state_lengths,
@@ -2145,11 +3206,15 @@ class PEETransformerCTCTimestampExtractor:
             source_frame_indices=source_frames_batch,
             time_lengths=time_lengths,
             separator_state_mask=separator_states_batch,
+            state_min_source_frames=state_min_frames_batch,
+            state_max_source_frames=state_max_frames_batch,
+            use_coarse_alignment=use_coarse_alignment,
         )
 
         rows: List[Dict[str, Any]] = []
         score_by_speaker: Dict[Optional[int], float] = {}
-        for stream, path, score in zip(streams, paths, scores):
+        coarse_diagnostics_by_speaker: Dict[Optional[int], Dict[str, Any]] = {}
+        for stream, path, score, coarse_diagnostic in zip(streams, paths, scores, coarse_diagnostics):
             rows.extend(
                 self._word_rows_from_path(
                     tokenized_words=stream['speaker_words'],
@@ -2166,7 +3231,8 @@ class PEETransformerCTCTimestampExtractor:
                 )
             )
             score_by_speaker[stream['speaker_tag']] = score
-        return rows, score_by_speaker
+            coarse_diagnostics_by_speaker[stream['speaker_tag']] = coarse_diagnostic
+        return rows, score_by_speaker, coarse_diagnostics_by_speaker
 
 
     def _ctc_viterbi_align(
@@ -2179,13 +3245,14 @@ class PEETransformerCTCTimestampExtractor:
         speaker_probs: Optional[torch.Tensor],
         speaker_logprob_weight: float,
         speaker_gate_threshold: Optional[float] = None,
-    ) -> Tuple[torch.Tensor, float]:
+        use_coarse_alignment: bool = True,
+    ) -> Tuple[torch.Tensor, float, Dict[str, Any]]:
         """Run blank-expanded CTC Viterbi DP with an optional Sortformer prior.
 
-        The recurrence is the one used by NeMo Forced Aligner: each state can stay,
-        advance one state, or skip a blank when the two surrounding non-blank labels
-        differ.  All arithmetic is fp32 on CPU because the PEE/CTC inference path is
-        commonly bf16.
+        The dense path remains the exact implementation. When
+        ``coarse_alignment_band_size`` is configured, an approximate coarse pass
+        first proposes a narrow target-state corridor for the fine DP; the method
+        automatically falls back to dense Viterbi if that corridor is unsuitable.
         """
         if ctc_log_probs.ndim != 2:
             raise ValueError(f"ctc_log_probs must have shape (T, V), got {tuple(ctc_log_probs.shape)}.")
@@ -2198,6 +3265,33 @@ class PEETransformerCTCTimestampExtractor:
         labels_tensor = torch.tensor(labels, dtype=torch.long)
         if int(labels_tensor.max().item()) >= log_probs.shape[1] or int(labels_tensor.min().item()) < 0:
             raise ValueError("CTC target contains labels outside the CTC vocabulary.")
+
+        # Route serialized alignment through the same narrow batched kernel when
+        # enabled. This prevents the old eager (T, target-state) emission
+        # materialization even for the default one-stream alignment mode.
+        if use_coarse_alignment and self.coarse_alignment_band_size is not None:
+            labels_batch = labels_tensor.unsqueeze(0)
+            state_columns_batch = torch.tensor(
+                [[-1 if column is None else int(column) for column in state_speaker_columns]],
+                dtype=torch.long,
+            )
+            full_source_frames = torch.arange(log_probs.shape[0], dtype=torch.long).unsqueeze(0)
+            paths, scores, diagnostics = self._ctc_viterbi_align_batched(
+                ctc_log_probs=log_probs,
+                labels=labels_batch,
+                state_lengths=torch.tensor([labels_tensor.numel()], dtype=torch.long),
+                blank_id=blank_id,
+                state_speaker_columns=state_columns_batch,
+                speaker_probs=speaker_probs,
+                speaker_logprob_weight=speaker_logprob_weight,
+                speaker_gate_threshold=speaker_gate_threshold,
+                source_frame_indices=full_source_frames,
+                time_lengths=torch.tensor([log_probs.shape[0]], dtype=torch.long),
+                separator_state_mask=torch.zeros_like(labels_batch, dtype=torch.bool),
+                use_coarse_alignment=True,
+            )
+            return paths[0], scores[0], diagnostics[0]
+
         emissions = log_probs.index_select(dim=1, index=labels_tensor)
 
         if speaker_gate_threshold is not None and not 0.0 <= float(speaker_gate_threshold) <= 1.0:
@@ -2228,60 +3322,13 @@ class PEETransformerCTCTimestampExtractor:
                     )
                 emissions[:, valid_states] = gated_emissions
 
-        num_frames, num_states = emissions.shape
-        if num_states < 2:
-            raise ValueError("CTC target must contain at least blank and one token state.")
-        neg_inf = -float('inf')
-        previous_scores = torch.full((num_states,), neg_inf, dtype=torch.float32)
-        previous_scores[0] = emissions[0, 0]
-        previous_scores[1] = emissions[0, 1]
-        backpointers = torch.full((num_frames, num_states), -1, dtype=torch.long)
-        backpointers[0, 0] = 0
-        backpointers[0, 1] = 1
-        state_indices = torch.arange(num_states, dtype=torch.long)
+        return self._ctc_viterbi_from_emissions(
+            emissions=emissions,
+            labels=labels_tensor,
+            blank_id=blank_id,
+            use_coarse_alignment=use_coarse_alignment,
+        )
 
-        for frame_index in range(1, num_frames):
-            best_scores = previous_scores.clone()
-            best_previous_states = state_indices.clone()
-
-            advance_one_scores = torch.full((num_states,), neg_inf, dtype=torch.float32)
-            advance_one_scores[1:] = previous_scores[:-1]
-            take_advance_one = advance_one_scores > best_scores
-            best_scores = torch.where(take_advance_one, advance_one_scores, best_scores)
-            best_previous_states = torch.where(take_advance_one, state_indices - 1, best_previous_states)
-
-            if num_states > 2:
-                skip_positions = torch.arange(2, num_states, dtype=torch.long)
-                can_skip = (labels_tensor[skip_positions] != blank_id) & (
-                    labels_tensor[skip_positions] != labels_tensor[skip_positions - 2]
-                )
-                if can_skip.any():
-                    allowed_positions = skip_positions[can_skip]
-                    skip_scores = torch.full((num_states,), neg_inf, dtype=torch.float32)
-                    skip_scores[allowed_positions] = previous_scores[allowed_positions - 2]
-                    take_skip = skip_scores > best_scores
-                    best_scores = torch.where(take_skip, skip_scores, best_scores)
-                    best_previous_states = torch.where(take_skip, state_indices - 2, best_previous_states)
-
-            previous_scores = best_scores + emissions[frame_index]
-            backpointers[frame_index] = best_previous_states
-
-        final_state = num_states - 1
-        if previous_scores[num_states - 2] > previous_scores[final_state]:
-            final_state = num_states - 2
-        final_score = previous_scores[final_state]
-        if not torch.isfinite(final_score):
-            raise ValueError("No valid CTC Viterbi path exists for this transcript and audio.")
-
-        path = torch.empty((num_frames,), dtype=torch.long)
-        state = int(final_state)
-        for frame_index in range(num_frames - 1, -1, -1):
-            path[frame_index] = state
-            if frame_index > 0:
-                state = int(backpointers[frame_index, state].item())
-                if state < 0:
-                    raise RuntimeError("CTC Viterbi backtrace reached an invalid state.")
-        return path, float(final_score.item())
 
     def _ctc_viterbi_align_batched(
         self,
@@ -2297,13 +3344,20 @@ class PEETransformerCTCTimestampExtractor:
         source_frame_indices: Optional[torch.Tensor] = None,
         time_lengths: Optional[torch.Tensor] = None,
         separator_state_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[List[torch.Tensor], List[float]]:
+        state_min_source_frames: Optional[torch.Tensor] = None,
+        state_max_source_frames: Optional[torch.Tensor] = None,
+        use_coarse_alignment: bool = True,
+    ) -> Tuple[List[torch.Tensor], List[float], List[Dict[str, Any]]]:
         """Run independent CTC Viterbi paths in a padded speaker batch.
 
         ``source_frame_indices`` selects a compact per-stream CTC timeline. A
         value of ``-1`` denotes a virtual separator: only a blank state at a
         complete-word boundary is allowed there. This makes a long Sortformer
         silence an actual alignment boundary rather than a cheap CTC blank run.
+        Optional ``state_min_source_frames`` and ``state_max_source_frames``
+        provide inclusive original-CTC-frame bounds for each target state.
+        They constrain non-blank token emissions on acoustic frames, while
+        leaving CTC blank transitions and virtual separators unrestricted.
         """
         if ctc_log_probs.ndim != 2:
             raise ValueError(f"ctc_log_probs must have shape (T, V), got {tuple(ctc_log_probs.shape)}.")
@@ -2367,12 +3421,56 @@ class PEETransformerCTCTimestampExtractor:
         if separator_state_mask.shape != labels.shape:
             raise ValueError("separator_state_mask must have shape (num_streams, max_states).")
         separator_state_mask = separator_state_mask & state_mask
+        state_min_source_frames, state_max_source_frames = self._normalize_state_source_frame_bounds(
+            state_min_source_frames=state_min_source_frames,
+            state_max_source_frames=state_max_source_frames,
+            labels=labels,
+            state_lengths=state_lengths,
+            blank_id=blank_id,
+            num_source_frames=num_source_frames,
+        )
+
+        # Do not construct the dense (streams, time, target-state) emission
+        # tensor when a coarse band is requested. The helper emits full target
+        # trellises only for the short coarse pass and for individual fallbacks;
+        # the fine pass gathers exactly the states inside each stream's band.
+        if use_coarse_alignment and self.coarse_alignment_band_size is not None:
+            return self._ctc_viterbi_align_batched_coarse_to_fine(
+                log_probs=log_probs,
+                labels=labels,
+                state_lengths=state_lengths,
+                blank_id=blank_id,
+                state_speaker_columns=state_speaker_columns,
+                speaker_probs=speaker_probs,
+                speaker_logprob_weight=speaker_logprob_weight,
+                speaker_gate_threshold=speaker_gate_threshold,
+                source_frame_indices=source_frame_indices,
+                time_lengths=time_lengths,
+                separator_state_mask=separator_state_mask,
+                virtual_time_mask=virtual_time_mask,
+                state_min_source_frames=state_min_source_frames,
+                state_max_source_frames=state_max_source_frames,
+            )
 
         safe_source_frames = source_frame_indices.clamp_min(0)
         emissions = log_probs[safe_source_frames.unsqueeze(-1), labels.unsqueeze(1)]
         neg_inf = -float('inf')
         emissions.masked_fill_(~state_mask.unsqueeze(1), neg_inf)
         emissions.masked_fill_(~time_mask.unsqueeze(-1), neg_inf)
+
+        # Per-state source-frame bounds apply only to non-blank tokens on
+        # actual acoustic frames. Blank states must remain available for the
+        # normal CTC transitions, including compact-timeline separators.
+        token_states = state_mask & (labels != blank_id)
+        out_of_bounds_tokens = (
+            actual_time_mask.unsqueeze(-1)
+            & token_states.unsqueeze(1)
+            & (
+                (safe_source_frames.unsqueeze(-1) < state_min_source_frames.unsqueeze(1))
+                | (safe_source_frames.unsqueeze(-1) > state_max_source_frames.unsqueeze(1))
+            )
+        )
+        emissions.masked_fill_(out_of_bounds_tokens, neg_inf)
 
         if speaker_probs is not None and (speaker_logprob_weight > 0.0 or speaker_gate_threshold is not None):
             speaker_probs = speaker_probs.detach().to(device='cpu', dtype=torch.float32)
@@ -2472,10 +3570,1009 @@ class PEETransformerCTCTimestampExtractor:
                 if (previous_states[valid_time] < 0).any():
                     raise RuntimeError("CTC Viterbi backtrace reached an invalid state.")
                 states = torch.where(valid_time, previous_states, states)
-        return [paths[index, : int(time_lengths[index].item())] for index in range(num_streams)], [
-            float(score.item()) for score in final_scores
-        ]
+        return (
+            [paths[index, : int(time_lengths[index].item())] for index in range(num_streams)],
+            [float(score.item()) for score in final_scores],
+            [
+                {
+                    'requested_band_size': None,
+                    'coarse_num_frames': None,
+                    'coarse_stride': None,
+                    'used_coarse_band': False,
+                    'fallback_reason': None,
+                }
+                for _ in range(num_streams)
+            ],
+        )
 
+    @staticmethod
+    def _normalize_state_source_frame_bounds(
+        *,
+        state_min_source_frames: Optional[torch.Tensor],
+        state_max_source_frames: Optional[torch.Tensor],
+        labels: torch.Tensor,
+        state_lengths: torch.Tensor,
+        blank_id: int,
+        num_source_frames: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Validate optional inclusive token-state source-frame bounds."""
+        num_streams, max_states = labels.shape
+        expected_shape = (num_streams, max_states)
+        if state_min_source_frames is None:
+            state_min_source_frames = torch.zeros(expected_shape, dtype=torch.long)
+        else:
+            state_min_source_frames = state_min_source_frames.detach().to(device='cpu', dtype=torch.long)
+        if state_max_source_frames is None:
+            state_max_source_frames = torch.full(
+                expected_shape,
+                num_source_frames - 1,
+                dtype=torch.long,
+            )
+        else:
+            state_max_source_frames = state_max_source_frames.detach().to(device='cpu', dtype=torch.long)
+        if state_min_source_frames.shape != expected_shape:
+            raise ValueError("state_min_source_frames must have shape (num_streams, max_states).")
+        if state_max_source_frames.shape != expected_shape:
+            raise ValueError("state_max_source_frames must have shape (num_streams, max_states).")
+
+        state_mask = torch.arange(max_states, dtype=torch.long).unsqueeze(0) < state_lengths.unsqueeze(1)
+        token_states = state_mask & (labels != blank_id)
+        invalid_bounds = token_states & (
+            (state_min_source_frames < 0)
+            | (state_max_source_frames >= num_source_frames)
+            | (state_min_source_frames > state_max_source_frames)
+        )
+        if invalid_bounds.any():
+            raise ValueError(
+                "state source-frame bounds must be inclusive valid CTC frame indices with min <= max "
+                "for every non-blank target state."
+            )
+        return state_min_source_frames, state_max_source_frames
+
+
+    def _ctc_viterbi_align_batched_coarse_to_fine(
+        self,
+        *,
+        log_probs: torch.Tensor,
+        labels: torch.Tensor,
+        state_lengths: torch.Tensor,
+        blank_id: int,
+        state_speaker_columns: torch.Tensor,
+        speaker_probs: Optional[torch.Tensor],
+        speaker_logprob_weight: float,
+        speaker_gate_threshold: Optional[float],
+        source_frame_indices: torch.Tensor,
+        time_lengths: torch.Tensor,
+        separator_state_mask: torch.Tensor,
+        virtual_time_mask: torch.Tensor,
+        state_min_source_frames: Optional[torch.Tensor] = None,
+        state_max_source_frames: Optional[torch.Tensor] = None,
+    ) -> Tuple[List[torch.Tensor], List[float], List[Dict[str, Any]]]:
+        """Align a padded speaker batch without a dense fine emission tensor.
+
+        Each stream first receives a short, max-pooled coarse CTC path. The
+        resulting per-frame center state defines a fixed-width band for the
+        fine recurrence. The coarse pass is only a soft-prior guide: it keeps
+        the Sortformer log-probability prior but deliberately disables the hard
+        speaker gate. The final banded emissions below retain and enforce the
+        caller's hard speaker gate. Unlike the legacy coarse path, the fine
+        emissions are indexed directly from ``log_probs`` as
+        ``(streams, time, 2 * N + 1)`` rather than materializing
+        ``(streams, time, target_states)``.  Streams whose coarse/fine paths
+        are unsuitable are rerun exactly through the existing dense batch path.
+        """
+        requested_band_size = self.coarse_alignment_band_size
+        if requested_band_size is None:
+            raise RuntimeError("Coarse-to-fine batch helper requires a positive band size.")
+
+        num_streams, max_states = labels.shape
+        max_time = source_frame_indices.shape[1]
+        state_min_source_frames, state_max_source_frames = self._normalize_state_source_frame_bounds(
+            state_min_source_frames=state_min_source_frames,
+            state_max_source_frames=state_max_source_frames,
+            labels=labels,
+            state_lengths=state_lengths,
+            blank_id=blank_id,
+            num_source_frames=log_probs.shape[0],
+        )
+        if speaker_probs is not None and (speaker_logprob_weight > 0.0 or speaker_gate_threshold is not None):
+            speaker_probs = speaker_probs.detach().to(device='cpu', dtype=torch.float32)
+            if speaker_probs.ndim != 2 or speaker_probs.shape[0] != log_probs.shape[0]:
+                raise ValueError("speaker_probs must have shape (T_ctc, num_speakers).")
+        else:
+            speaker_probs = None
+
+        # Construct each stream's compact coarse timeline independently. The
+        # grouping is necessarily stream-specific because active regions,
+        # virtual separators, and transcript lengths differ, but the pooled
+        # emissions and the actual coarse Viterbi recurrence below are batched
+        # across every usable stream.
+        state_centers = torch.zeros((num_streams, max_time), dtype=torch.long)
+        coarse_num_frames: List[Optional[int]] = [None] * num_streams
+        coarse_strides: List[Optional[int]] = [None] * num_streams
+        coarse_target_acoustic_frames: List[Optional[int]] = [None] * num_streams
+        coarse_grouping_modes: List[Optional[str]] = [None] * num_streams
+        fallback_reasons: List[Optional[str]] = [None] * num_streams
+        coarse_ready = torch.zeros(num_streams, dtype=torch.bool)
+        coarse_groups: List[Optional[List[Tuple[int, int]]]] = [None] * num_streams
+
+        for stream_index in range(num_streams):
+            stream_time = int(time_lengths[stream_index].item())
+            stream_states = int(state_lengths[stream_index].item())
+            stream_virtual = virtual_time_mask[stream_index, :stream_time]
+            token_labels = labels[stream_index, :stream_states]
+            token_labels = token_labels[token_labels != blank_id].tolist()
+            minimum_frames = self._minimum_ctc_frames(token_labels)
+
+            groups: Optional[List[Tuple[int, int]]] = None
+            for candidate_stride in range(4, 1, -1):
+                candidate_groups = self._coarse_time_groups(
+                    num_frames=stream_time,
+                    stride=candidate_stride,
+                    virtual_time_mask=stream_virtual,
+                )
+                acoustic_group_count = sum(
+                    not bool(stream_virtual[start].item()) for start, _ in candidate_groups
+                )
+                if acoustic_group_count >= minimum_frames:
+                    groups = candidate_groups
+                    coarse_strides[stream_index] = candidate_stride
+                    coarse_target_acoustic_frames[stream_index] = acoustic_group_count
+                    coarse_grouping_modes[stream_index] = 'fixed_stride'
+                    break
+
+            # A uniform stride of two can still be too aggressive for dense
+            # BPE targets: CTC needs at least one acoustic coarse frame per
+            # token (plus repeated-token blanks). In that case, retain the
+            # required number plus a modest slack by mixing singleton and
+            # two-frame groups. Virtual separators and each active region's
+            # first/last acoustic frame remain singleton groups.
+            if groups is None:
+                acoustic_frame_count = int((~stream_virtual).sum().item())
+                target_slack = min(
+                    acoustic_frame_count - minimum_frames,
+                    max(8, int(math.ceil(0.05 * minimum_frames))),
+                )
+                target_acoustic_groups = minimum_frames + target_slack
+                coarse_target_acoustic_frames[stream_index] = target_acoustic_groups
+                candidate_groups = self._coarse_time_groups_target_aware(
+                    num_frames=stream_time,
+                    target_acoustic_groups=target_acoustic_groups,
+                    virtual_time_mask=stream_virtual,
+                )
+                acoustic_group_count = sum(
+                    not bool(stream_virtual[start].item()) for start, _ in candidate_groups
+                )
+                if acoustic_group_count >= minimum_frames:
+                    groups = candidate_groups
+                    # This construction deliberately mixes singleton and
+                    # two-frame groups, so it has no uniform coarse stride.
+                    coarse_grouping_modes[stream_index] = 'target_aware_mixed_1_2'
+
+            if groups is None or len(groups) >= stream_time:
+                fallback_reasons[stream_index] = 'insufficient_coarse_compression'
+                if groups is not None:
+                    coarse_num_frames[stream_index] = len(groups)
+                continue
+
+            coarse_num_frames[stream_index] = len(groups)
+            coarse_groups[stream_index] = groups
+
+        # Group construction above uses Python lists, but all expensive CTC
+        # operations below are batched. Bucket pooled groups by width (at most
+        # four for the current coarse strategies) so we never materialize a
+        # full fine (stream_time, target_states) trellis just to form the
+        # shorter coarse pass.
+        ready_stream_indices = [
+            stream_index for stream_index, groups in enumerate(coarse_groups) if groups is not None
+        ]
+        if ready_stream_indices:
+            ready_index_tensor = torch.tensor(ready_stream_indices, dtype=torch.long)
+            typed_ready_group_lists: List[List[Tuple[int, int]]] = []
+            for stream_index in ready_stream_indices:
+                groups = coarse_groups[stream_index]
+                if groups is None:
+                    raise RuntimeError("Coarse-ready stream is missing its group timeline.")
+                typed_ready_group_lists.append(groups)
+
+            max_coarse_time = max(len(groups) for groups in typed_ready_group_lists)
+            coarse_time_lengths = torch.tensor(
+                [len(groups) for groups in typed_ready_group_lists], dtype=torch.long
+            )
+            coarse_emissions = torch.full(
+                (len(ready_stream_indices), max_coarse_time, max_states),
+                -float('inf'),
+                dtype=log_probs.dtype,
+            )
+            groups_by_width: Dict[int, List[Tuple[int, int]]] = {}
+            for ready_stream_index, groups in enumerate(typed_ready_group_lists):
+                for group_index, (start, end) in enumerate(groups):
+                    groups_by_width.setdefault(end - start, []).append((ready_stream_index, group_index))
+
+            for group_width, group_locations in groups_by_width.items():
+                group_ready_indices = torch.tensor(
+                    [ready_stream_index for ready_stream_index, _ in group_locations], dtype=torch.long
+                )
+                group_coarse_indices = torch.tensor(
+                    [group_index for _, group_index in group_locations], dtype=torch.long
+                )
+                original_stream_indices = ready_index_tensor[group_ready_indices]
+                group_sources = torch.stack(
+                    [
+                        source_frame_indices[
+                            ready_stream_indices[ready_stream_index],
+                            typed_ready_group_lists[ready_stream_index][group_index][0] : typed_ready_group_lists[
+                                ready_stream_index
+                            ][group_index][1],
+                        ]
+                        for ready_stream_index, group_index in group_locations
+                    ],
+                    dim=0,
+                )
+                group_count = len(group_locations)
+                group_states = (
+                    torch.arange(max_states, dtype=torch.long)
+                    .view(1, 1, max_states)
+                    .expand(group_count, group_width, max_states)
+                )
+                group_emissions = self._gather_ctc_emissions_for_states(
+                    log_probs=log_probs,
+                    labels=labels[original_stream_indices],
+                    state_lengths=state_lengths[original_stream_indices],
+                    source_frame_indices=group_sources,
+                    time_lengths=torch.full((group_count,), group_width, dtype=torch.long),
+                    state_speaker_columns=state_speaker_columns[original_stream_indices],
+                    speaker_probs=speaker_probs,
+                    speaker_logprob_weight=speaker_logprob_weight,
+                    # This coarse path only guides the state corridor. A hard
+                    # gate would make that guide brittle when pooled frames
+                    # straddle a Sortformer boundary; the fine pass below
+                    # retains the caller's gate and enforces the actual mask.
+                    speaker_gate_threshold=None,
+                    separator_state_mask=separator_state_mask[original_stream_indices],
+                    state_indices=group_states,
+                    blank_id=blank_id,
+                    state_min_source_frames=state_min_source_frames[original_stream_indices],
+                    state_max_source_frames=state_max_source_frames[original_stream_indices],
+                )
+                # Virtual separators are singleton groups, so pooling never
+                # crosses one. Advanced indexing scatters each pooled row back
+                # into the padded coarse batch.
+                coarse_emissions[group_ready_indices, group_coarse_indices] = group_emissions.amax(dim=1)
+
+            coarse_paths, _, coarse_valid = self._ctc_viterbi_dp_dense_batched(
+                emissions=coarse_emissions,
+                labels=labels[ready_index_tensor],
+                state_lengths=state_lengths[ready_index_tensor],
+                time_lengths=coarse_time_lengths,
+                blank_id=blank_id,
+            )
+            for ready_stream_index, original_stream_index in enumerate(ready_stream_indices):
+                if not bool(coarse_valid[ready_stream_index].item()):
+                    fallback_reasons[original_stream_index] = 'coarse_path_unavailable'
+                    continue
+                stream_time = int(time_lengths[original_stream_index].item())
+                state_centers[original_stream_index, :stream_time] = self._expand_coarse_state_path(
+                    coarse_path=coarse_paths[
+                        ready_stream_index, : int(coarse_time_lengths[ready_stream_index].item())
+                    ],
+                    groups=typed_ready_group_lists[ready_stream_index],
+                    num_frames=stream_time,
+                )
+                coarse_ready[original_stream_index] = True
+
+        # Shift a fixed-width interval at target edges rather than shrinking it:
+        # this keeps the fine tensor rectangular and vectorizable across streams.
+        max_band_width = min(max_states, 2 * requested_band_size + 1)
+        band_widths = torch.minimum(state_lengths, torch.full_like(state_lengths, max_band_width))
+        max_band_starts = (state_lengths - band_widths).clamp_min(0)
+        band_starts = (state_centers - requested_band_size).clamp_min(0)
+        band_starts = torch.minimum(band_starts, max_band_starts.unsqueeze(1))
+        local_band_states = torch.arange(max_band_width, dtype=torch.long).view(1, 1, max_band_width)
+        band_state_indices = band_starts.unsqueeze(-1) + local_band_states
+
+        band_emissions = self._gather_ctc_emissions_for_states(
+            log_probs=log_probs,
+            labels=labels,
+            state_lengths=state_lengths,
+            source_frame_indices=source_frame_indices,
+            time_lengths=time_lengths,
+            state_speaker_columns=state_speaker_columns,
+            speaker_probs=speaker_probs,
+            speaker_logprob_weight=speaker_logprob_weight,
+            speaker_gate_threshold=speaker_gate_threshold,
+            separator_state_mask=separator_state_mask,
+            state_indices=band_state_indices,
+            blank_id=blank_id,
+            state_min_source_frames=state_min_source_frames,
+            state_max_source_frames=state_max_source_frames,
+        )
+        fine_paths, fine_scores, fine_valid, fine_touched_edge = self._ctc_viterbi_dp_banded_batched(
+            emissions=band_emissions,
+            labels=labels,
+            state_lengths=state_lengths,
+            time_lengths=time_lengths,
+            blank_id=blank_id,
+            band_starts=band_starts,
+            band_widths=band_widths,
+        )
+
+        # Decide all fallbacks before running them. A single dense padded call
+        # keeps exceptional streams vectorized too, rather than recursively
+        # running one Viterbi recurrence per speaker.
+        for stream_index in range(num_streams):
+            fallback_reason = fallback_reasons[stream_index]
+            if fallback_reason is None and not bool(coarse_ready[stream_index].item()):
+                fallback_reason = 'coarse_path_unavailable'
+            if fallback_reason is None and not bool(fine_valid[stream_index].item()):
+                fallback_reason = 'band_has_no_valid_path'
+            if fallback_reason is None and bool(fine_touched_edge[stream_index].item()):
+                fallback_reason = 'path_touched_band_edge'
+            fallback_reasons[stream_index] = fallback_reason
+
+        fallback_stream_indices = [
+            stream_index for stream_index, fallback_reason in enumerate(fallback_reasons) if fallback_reason is not None
+        ]
+        fallback_paths: Dict[int, torch.Tensor] = {}
+        fallback_scores: Dict[int, float] = {}
+        if fallback_stream_indices:
+            fallback_index_tensor = torch.tensor(fallback_stream_indices, dtype=torch.long)
+            dense_paths, dense_scores, _ = self._ctc_viterbi_align_batched(
+                ctc_log_probs=log_probs,
+                labels=labels[fallback_index_tensor],
+                state_lengths=state_lengths[fallback_index_tensor],
+                blank_id=blank_id,
+                state_speaker_columns=state_speaker_columns[fallback_index_tensor],
+                speaker_probs=speaker_probs,
+                speaker_logprob_weight=speaker_logprob_weight,
+                speaker_gate_threshold=speaker_gate_threshold,
+                source_frame_indices=source_frame_indices[fallback_index_tensor],
+                time_lengths=time_lengths[fallback_index_tensor],
+                separator_state_mask=separator_state_mask[fallback_index_tensor],
+                state_min_source_frames=state_min_source_frames[fallback_index_tensor],
+                state_max_source_frames=state_max_source_frames[fallback_index_tensor],
+                use_coarse_alignment=False,
+            )
+            for fallback_batch_index, stream_index in enumerate(fallback_stream_indices):
+                fallback_paths[stream_index] = dense_paths[fallback_batch_index]
+                fallback_scores[stream_index] = dense_scores[fallback_batch_index]
+
+        paths: List[torch.Tensor] = []
+        scores: List[float] = []
+        diagnostics: List[Dict[str, Any]] = []
+        for stream_index in range(num_streams):
+            stream_time = int(time_lengths[stream_index].item())
+            fallback_reason = fallback_reasons[stream_index]
+            if fallback_reason is None:
+                paths.append(fine_paths[stream_index, :stream_time].clone())
+                scores.append(float(fine_scores[stream_index].item()))
+                diagnostics.append(
+                    {
+                        'requested_band_size': requested_band_size,
+                        'coarse_num_frames': coarse_num_frames[stream_index],
+                        'coarse_stride': coarse_strides[stream_index],
+                        'used_coarse_band': True,
+                        'fallback_reason': None,
+                        'fine_band_max_states': int(band_widths[stream_index].item()),
+                        'coarse_frame_selection': 'max_pool',
+                        'coarse_hard_speaker_gate': (
+                            'disabled_for_guide' if speaker_gate_threshold is not None else 'not_requested'
+                        ),
+                        'coarse_target_acoustic_frames': coarse_target_acoustic_frames[stream_index],
+                        'coarse_grouping_mode': coarse_grouping_modes[stream_index],
+                    }
+                )
+                continue
+
+            paths.append(fallback_paths[stream_index])
+            scores.append(fallback_scores[stream_index])
+            diagnostics.append(
+                {
+                    'requested_band_size': requested_band_size,
+                    'coarse_num_frames': coarse_num_frames[stream_index],
+                    'coarse_stride': coarse_strides[stream_index],
+                    'used_coarse_band': False,
+                    'fallback_reason': fallback_reason,
+                    'fine_band_max_states': int(band_widths[stream_index].item()),
+                    'coarse_frame_selection': 'max_pool',
+                    'coarse_hard_speaker_gate': (
+                        'disabled_for_guide' if speaker_gate_threshold is not None else 'not_requested'
+                    ),
+                    'coarse_target_acoustic_frames': coarse_target_acoustic_frames[stream_index],
+                    'coarse_grouping_mode': coarse_grouping_modes[stream_index],
+                }
+            )
+        return paths, scores, diagnostics
+
+    def _gather_ctc_emissions_for_states(
+        self,
+        *,
+        log_probs: torch.Tensor,
+        labels: torch.Tensor,
+        state_lengths: torch.Tensor,
+        source_frame_indices: torch.Tensor,
+        time_lengths: torch.Tensor,
+        state_speaker_columns: torch.Tensor,
+        speaker_probs: Optional[torch.Tensor],
+        speaker_logprob_weight: float,
+        speaker_gate_threshold: Optional[float],
+        separator_state_mask: torch.Tensor,
+        state_indices: torch.Tensor,
+        blank_id: int,
+        state_min_source_frames: Optional[torch.Tensor] = None,
+        state_max_source_frames: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Gather CTC emissions for arbitrary target-state indices.
+
+        This is the key memory-pruning primitive for batched coarse-to-fine
+        alignment. ``state_indices`` has the desired final state dimension, so
+        no intermediate ``(streams, time, all_target_states)`` tensor is built.
+        """
+        if state_indices.ndim != 3:
+            raise ValueError("state_indices must have shape (num_streams, max_time, num_states).")
+        num_streams, max_states = labels.shape
+        if state_indices.shape[0] != num_streams or source_frame_indices.shape[0] != num_streams:
+            raise ValueError("State and source-frame batches must have the same number of streams.")
+        if state_indices.shape[1] != source_frame_indices.shape[1]:
+            raise ValueError("state_indices and source_frame_indices must have the same time dimension.")
+
+        _, max_time, _ = state_indices.shape
+        state_min_source_frames, state_max_source_frames = self._normalize_state_source_frame_bounds(
+            state_min_source_frames=state_min_source_frames,
+            state_max_source_frames=state_max_source_frames,
+            labels=labels,
+            state_lengths=state_lengths,
+            blank_id=blank_id,
+            num_source_frames=log_probs.shape[0],
+        )
+        state_indices = state_indices.detach().to(device='cpu', dtype=torch.long)
+        time_mask = torch.arange(max_time, dtype=torch.long).unsqueeze(0) < time_lengths.unsqueeze(1)
+        valid_states = (
+            time_mask.unsqueeze(-1)
+            & (state_indices >= 0)
+            & (state_indices < state_lengths.view(num_streams, 1, 1))
+        )
+        safe_state_indices = state_indices.clamp(min=0, max=max_states - 1)
+        state_labels = labels.gather(1, safe_state_indices.reshape(num_streams, -1)).reshape_as(safe_state_indices)
+        safe_source_frames = source_frame_indices.clamp_min(0)
+        emissions = log_probs[safe_source_frames.unsqueeze(-1), state_labels]
+        neg_inf = -float('inf')
+        emissions.masked_fill_(~valid_states, neg_inf)
+
+        actual_time = time_mask & (source_frame_indices >= 0)
+        gathered_min_frames = state_min_source_frames.gather(
+            1, safe_state_indices.reshape(num_streams, -1)
+        ).reshape_as(safe_state_indices)
+        gathered_max_frames = state_max_source_frames.gather(
+            1, safe_state_indices.reshape(num_streams, -1)
+        ).reshape_as(safe_state_indices)
+        out_of_bounds_tokens = (
+            valid_states
+            & actual_time.unsqueeze(-1)
+            & (state_labels != blank_id)
+            & (
+                (safe_source_frames.unsqueeze(-1) < gathered_min_frames)
+                | (safe_source_frames.unsqueeze(-1) > gathered_max_frames)
+            )
+        )
+        emissions.masked_fill_(out_of_bounds_tokens, neg_inf)
+
+        if speaker_probs is not None:
+            state_columns = state_speaker_columns.gather(
+                1, safe_state_indices.reshape(num_streams, -1)
+            ).reshape_as(safe_state_indices)
+            token_states = valid_states & actual_time.unsqueeze(-1) & (state_columns >= 0)
+            if token_states.any():
+                referenced_columns = state_columns[token_states]
+                if int(referenced_columns.max().item()) >= speaker_probs.shape[1]:
+                    raise ValueError("speaker mapping references a missing Sortformer column.")
+                safe_columns = state_columns.clamp_min(0)
+                activity = speaker_probs[safe_source_frames.unsqueeze(-1), safe_columns]
+                if speaker_logprob_weight > 0.0:
+                    emissions = emissions + torch.where(
+                        token_states,
+                        float(speaker_logprob_weight) * torch.log(activity.clamp_min(self.epsilon)),
+                        torch.zeros_like(activity),
+                    )
+                if speaker_gate_threshold is not None:
+                    emissions.masked_fill_(
+                        token_states & (activity < float(speaker_gate_threshold)),
+                        neg_inf,
+                    )
+
+        virtual_time = time_mask & (source_frame_indices < 0)
+        if virtual_time.any():
+            separator_states = separator_state_mask.gather(
+                1, safe_state_indices.reshape(num_streams, -1)
+            ).reshape_as(safe_state_indices)
+            virtual_emissions = torch.where(
+                separator_states & valid_states,
+                torch.zeros_like(emissions),
+                torch.full_like(emissions, neg_inf),
+            )
+            emissions = torch.where(virtual_time.unsqueeze(-1), virtual_emissions, emissions)
+        return emissions
+
+    @staticmethod
+    def _ctc_viterbi_dp_banded_batched(
+        *,
+        emissions: torch.Tensor,
+        labels: torch.Tensor,
+        state_lengths: torch.Tensor,
+        time_lengths: torch.Tensor,
+        blank_id: int,
+        band_starts: torch.Tensor,
+        band_widths: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run a vectorized CTC Viterbi recurrence in variable state bands.
+
+        Backpointers store only the relative CTC transition (stay, +1, +2),
+        using ``int8`` instead of full global-state indices.  A per-frame band
+        start converts the local backtrace position back to a global target
+        state without allocating a dense target-state trellis.
+        """
+        if emissions.ndim != 3:
+            raise ValueError("emissions must have shape (num_streams, max_time, max_band_states).")
+        num_streams, max_time, max_band_width = emissions.shape
+        if labels.ndim != 2 or labels.shape[0] != num_streams:
+            raise ValueError("labels must have shape (num_streams, max_target_states).")
+        if band_starts.shape != (num_streams, max_time):
+            raise ValueError("band_starts must have shape (num_streams, max_time).")
+        if state_lengths.shape != (num_streams,) or time_lengths.shape != (num_streams,):
+            raise ValueError("state_lengths and time_lengths must have shape (num_streams,).")
+        if band_widths.shape != (num_streams,) or int(band_widths.min().item()) < 1:
+            raise ValueError("band_widths must be positive and have shape (num_streams,).")
+
+        neg_inf = -float('inf')
+        invalid_step = -128
+        local_states = torch.arange(max_band_width, dtype=torch.long).unsqueeze(0)
+        local_state_mask = local_states < band_widths.unsqueeze(1)
+        initial_global_states = band_starts[:, 0].unsqueeze(1) + local_states
+        initial_valid = local_state_mask & ((initial_global_states == 0) | (initial_global_states == 1))
+        previous_scores = torch.where(
+            initial_valid,
+            emissions[:, 0, :],
+            torch.full_like(emissions[:, 0, :], neg_inf),
+        )
+        backpointers = torch.full(
+            (max_time, num_streams, max_band_width),
+            invalid_step,
+            dtype=torch.int8,
+        )
+        backpointers[0] = torch.where(
+            initial_valid,
+            torch.zeros((num_streams, max_band_width), dtype=torch.int8),
+            torch.full((num_streams, max_band_width), invalid_step, dtype=torch.int8),
+        )
+        previous_starts = band_starts[:, 0]
+
+        for frame_index in range(1, max_time):
+            current_starts = band_starts[:, frame_index]
+            current_global_states = current_starts.unsqueeze(1) + local_states
+            current_valid = local_state_mask & (current_global_states < state_lengths.unsqueeze(1))
+
+            def previous_at(offset: int) -> torch.Tensor:
+                previous_local_states = current_global_states + offset - previous_starts.unsqueeze(1)
+                previous_valid = (previous_local_states >= 0) & (
+                    previous_local_states < band_widths.unsqueeze(1)
+                )
+                gathered = previous_scores.gather(
+                    1, previous_local_states.clamp(min=0, max=max_band_width - 1)
+                )
+                return gathered.masked_fill(~previous_valid, neg_inf)
+
+            best_scores = previous_at(0)
+            best_steps = torch.zeros((num_streams, max_band_width), dtype=torch.int8)
+            advance_one_scores = previous_at(-1)
+            take_advance_one = advance_one_scores > best_scores
+            best_scores = torch.where(take_advance_one, advance_one_scores, best_scores)
+            best_steps = torch.where(
+                take_advance_one,
+                torch.full_like(best_steps, -1),
+                best_steps,
+            )
+
+            safe_current_states = current_global_states.clamp(min=0, max=labels.shape[1] - 1)
+            safe_two_back_states = (current_global_states - 2).clamp(min=0, max=labels.shape[1] - 1)
+            current_labels = labels.gather(1, safe_current_states)
+            two_back_labels = labels.gather(1, safe_two_back_states)
+            can_skip = (
+                current_valid
+                & (current_global_states >= 2)
+                & (current_labels != blank_id)
+                & (current_labels != two_back_labels)
+            )
+            skip_scores = previous_at(-2).masked_fill(~can_skip, neg_inf)
+            take_skip = skip_scores > best_scores
+            best_scores = torch.where(take_skip, skip_scores, best_scores)
+            best_steps = torch.where(take_skip, torch.full_like(best_steps, -2), best_steps)
+
+            updated_scores = (best_scores + emissions[:, frame_index, :]).masked_fill(~current_valid, neg_inf)
+            valid_time = frame_index < time_lengths
+            previous_scores = torch.where(valid_time.unsqueeze(1), updated_scores, previous_scores)
+            previous_starts = torch.where(valid_time, current_starts, previous_starts)
+            backpointers[frame_index] = torch.where(
+                valid_time.unsqueeze(1) & current_valid,
+                best_steps,
+                torch.full_like(best_steps, invalid_step),
+            )
+
+        last_time_indices = (time_lengths - 1).unsqueeze(1)
+        last_band_starts = band_starts.gather(1, last_time_indices).squeeze(1)
+        final_blank_states = state_lengths - 1
+        final_token_states = state_lengths - 2
+
+        def final_score_for(states: torch.Tensor) -> torch.Tensor:
+            local = states - last_band_starts
+            valid = (local >= 0) & (local < band_widths)
+            gathered = previous_scores.gather(1, local.clamp(min=0, max=max_band_width - 1).unsqueeze(1)).squeeze(1)
+            return gathered.masked_fill(~valid, neg_inf)
+
+        final_blank_scores = final_score_for(final_blank_states)
+        final_token_scores = final_score_for(final_token_states)
+        choose_token = final_token_scores > final_blank_scores
+        final_states = torch.where(choose_token, final_token_states, final_blank_states)
+        final_scores = torch.where(choose_token, final_token_scores, final_blank_scores)
+        valid_paths = torch.isfinite(final_scores)
+
+        paths = torch.full((num_streams, max_time), -1, dtype=torch.long)
+        touched_band_edge = torch.zeros(num_streams, dtype=torch.bool)
+        states = final_states.clone()
+        for frame_index in range(max_time - 1, -1, -1):
+            valid_time = frame_index < time_lengths
+            current_starts = band_starts[:, frame_index]
+            local = states - current_starts
+            in_band = (local >= 0) & (local < band_widths)
+            valid_paths &= ~valid_time | in_band
+            write_mask = valid_time & in_band
+            paths[write_mask, frame_index] = states[write_mask]
+            band_ends = current_starts + band_widths - 1
+            touched_band_edge |= write_mask & (
+                ((current_starts > 0) & (states == current_starts))
+                | ((band_ends < state_lengths - 1) & (states == band_ends))
+            )
+            if frame_index > 0:
+                steps = backpointers[frame_index].gather(
+                    1, local.clamp(min=0, max=max_band_width - 1).unsqueeze(1)
+                ).squeeze(1)
+                valid_step = steps != invalid_step
+                valid_paths &= ~valid_time | valid_step
+                update_mask = write_mask & valid_step
+                states = torch.where(update_mask, states + steps.to(dtype=torch.long), states)
+        return paths, final_scores, valid_paths, touched_band_edge
+
+
+    @staticmethod
+    def _ctc_viterbi_dp_dense_batched(
+        *,
+        emissions: torch.Tensor,
+        labels: torch.Tensor,
+        state_lengths: torch.Tensor,
+        time_lengths: torch.Tensor,
+        blank_id: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run exact full-state CTC Viterbi for a variable-length stream batch.
+
+        This is the coarse-pass counterpart to ``_ctc_viterbi_dp_banded_batched``.
+        It uses the same vectorized recurrence with a zero band start and a
+        band width equal to each stream's full CTC target length, so there is
+        no state-space approximation. Padding masks allow coarse timelines and
+        blank-expanded targets to have different lengths in the same batch.
+        """
+        if emissions.ndim != 3:
+            raise ValueError("emissions must have shape (num_streams, max_time, max_target_states).")
+        num_streams, max_time, max_states = emissions.shape
+        if num_streams == 0 or max_time < 1 or max_states < 2:
+            raise ValueError("Batched CTC emissions must contain streams, frames, and at least two states.")
+        if labels.shape != (num_streams, max_states):
+            raise ValueError("labels must have shape (num_streams, max_target_states).")
+        if state_lengths.shape != (num_streams,) or time_lengths.shape != (num_streams,):
+            raise ValueError("state_lengths and time_lengths must have shape (num_streams,).")
+        if int(state_lengths.min().item()) < 2 or int(state_lengths.max().item()) > max_states:
+            raise ValueError("state_lengths must be in [2, max_target_states].")
+        if int(time_lengths.min().item()) < 1 or int(time_lengths.max().item()) > max_time:
+            raise ValueError("time_lengths must be in [1, max_time].")
+
+        band_starts = torch.zeros((num_streams, max_time), dtype=torch.long)
+        paths, scores, valid, _ = PEETransformerCTCTimestampExtractor._ctc_viterbi_dp_banded_batched(
+            emissions=emissions,
+            labels=labels,
+            state_lengths=state_lengths,
+            time_lengths=time_lengths,
+            blank_id=blank_id,
+            band_starts=band_starts,
+            band_widths=state_lengths,
+        )
+        return paths, scores, valid
+
+
+    def _ctc_viterbi_from_emissions(
+        self,
+        *,
+        emissions: torch.Tensor,
+        labels: torch.Tensor,
+        blank_id: int,
+        virtual_time_mask: Optional[torch.Tensor] = None,
+        use_coarse_alignment: bool = True,
+    ) -> Tuple[torch.Tensor, float, Dict[str, Any]]:
+        """Run exact dense Viterbi on an already materialized single trellis.
+
+        Coarse-enabled callers route through the direct-gather batched kernel
+        before creating ``emissions``. This retained helper is therefore the
+        exact dense path used when coarse alignment is disabled (including the
+        preliminary speaker-column mapping).
+        """
+        if emissions.ndim != 2:
+            raise ValueError(f"emissions must have shape (T, S), got {tuple(emissions.shape)}.")
+        if labels.ndim != 1 or labels.shape[0] != emissions.shape[1]:
+            raise ValueError("labels must have shape (S,) matching emissions.")
+        emissions = emissions.detach().to(device='cpu', dtype=torch.float32)
+        labels = labels.detach().to(device='cpu', dtype=torch.long)
+        num_frames, num_states = emissions.shape
+        if num_frames < 1 or num_states < 2:
+            raise ValueError("CTC emissions must contain at least one frame and two states.")
+        if virtual_time_mask is not None:
+            virtual_time_mask = virtual_time_mask.detach().to(device='cpu', dtype=torch.bool)
+            if virtual_time_mask.ndim != 1 or virtual_time_mask.numel() != num_frames:
+                raise ValueError("virtual_time_mask must have shape (T,).")
+        # Keep this private argument to make the exact preliminary call explicit.
+        _ = use_coarse_alignment
+        path, score = self._ctc_viterbi_dp_dense(
+            emissions=emissions,
+            labels=labels,
+            blank_id=blank_id,
+        )
+        return path, score, {
+            'requested_band_size': None,
+            'coarse_num_frames': None,
+            'coarse_stride': None,
+            'used_coarse_band': False,
+            'fallback_reason': None,
+        }
+
+
+    @staticmethod
+    def _coarse_time_groups(
+        *,
+        num_frames: int,
+        stride: int,
+        virtual_time_mask: torch.Tensor,
+    ) -> List[Tuple[int, int]]:
+        """Pool acoustic compact-time regions while retaining their endpoints."""
+        if num_frames < 1 or stride < 1:
+            raise ValueError("num_frames and stride must both be positive.")
+        if virtual_time_mask.ndim != 1 or virtual_time_mask.numel() != num_frames:
+            raise ValueError("virtual_time_mask must have shape (T,).")
+
+        groups: List[Tuple[int, int]] = []
+        cursor = 0
+        while cursor < num_frames:
+            if bool(virtual_time_mask[cursor].item()):
+                groups.append((cursor, cursor + 1))
+                cursor += 1
+                continue
+
+            region_start = cursor
+            while cursor < num_frames and not bool(virtual_time_mask[cursor].item()):
+                cursor += 1
+            region_end = cursor
+            region_length = region_end - region_start
+            if region_length <= 2:
+                groups.extend((frame, frame + 1) for frame in range(region_start, region_end))
+                continue
+
+            groups.append((region_start, region_start + 1))
+            middle_end = region_end - 1
+            middle_start = region_start + 1
+            while middle_start < middle_end:
+                middle_stop = min(middle_start + stride, middle_end)
+                groups.append((middle_start, middle_stop))
+                middle_start = middle_stop
+            groups.append((region_end - 1, region_end))
+        return groups
+
+    @staticmethod
+    def _coarse_time_groups_target_aware(
+        *,
+        num_frames: int,
+        target_acoustic_groups: int,
+        virtual_time_mask: torch.Tensor,
+    ) -> List[Tuple[int, int]]:
+        """Build a compressed CTC timeline retaining a target acoustic count.
+
+        This is the fallback grouping strategy when even a uniform two-frame
+        coarse pass would leave fewer frames than the CTC target's minimum
+        legal duration. It starts from the uncompressed compact timeline and
+        spends the available compression budget as two-frame acoustic groups.
+        The caller chooses ``target_acoustic_groups`` at or above the target's
+        minimum legal CTC duration. Virtual separators and the first and last
+        acoustic frame of every active region always remain singleton groups.
+
+        The pair budget is distributed proportionally over active regions, then
+        pairs in each region are spread deterministically through its interior.
+        This avoids concentrating representative-frame loss in an early region
+        of a multi-region speaker timeline.
+        """
+        if num_frames < 1:
+            raise ValueError("num_frames must be positive.")
+        if isinstance(target_acoustic_groups, bool) or not isinstance(target_acoustic_groups, int):
+            raise TypeError("target_acoustic_groups must be an integer.")
+        if target_acoustic_groups < 0:
+            raise ValueError("target_acoustic_groups must be non-negative.")
+        if virtual_time_mask.ndim != 1 or virtual_time_mask.numel() != num_frames:
+            raise ValueError("virtual_time_mask must have shape (T,).")
+
+        virtual_time_mask = virtual_time_mask.detach().to(device='cpu', dtype=torch.bool)
+        acoustic_frame_count = int((~virtual_time_mask).sum().item())
+        if target_acoustic_groups > acoustic_frame_count:
+            raise ValueError(
+                "target_acoustic_groups cannot exceed the number of acoustic compact-time frames."
+            )
+
+        # Split the compact timeline into contiguous acoustic regions and
+        # singleton virtual separators. Region endpoints are deliberately kept
+        # unpooled so each active region has CTC context at both boundaries.
+        segments: List[Tuple[bool, int, int]] = []
+        acoustic_regions: List[Tuple[int, int]] = []
+        cursor = 0
+        while cursor < num_frames:
+            if bool(virtual_time_mask[cursor].item()):
+                segments.append((True, cursor, cursor + 1))
+                cursor += 1
+                continue
+            start = cursor
+            while cursor < num_frames and not bool(virtual_time_mask[cursor].item()):
+                cursor += 1
+            acoustic_regions.append((start, cursor))
+            segments.append((False, start, cursor))
+
+        pair_capacities = [max(0, (end - start - 2) // 2) for start, end in acoustic_regions]
+        max_pair_count = sum(pair_capacities)
+        # A two-frame group replaces two singleton groups and therefore spends
+        # one unit of the acoustic-group compression budget.
+        pair_budget = min(acoustic_frame_count - target_acoustic_groups, max_pair_count)
+
+        pair_counts = [0] * len(acoustic_regions)
+        if pair_budget and max_pair_count:
+            # Give each region a proportional base allocation, then resolve the
+            # remaining pairs by largest fractional remainder (stable tie break
+            # by region order). This is deterministic and cannot exceed a
+            # region's pair capacity.
+            remainders: List[Tuple[int, int]] = []
+            allocated = 0
+            for region_index, capacity in enumerate(pair_capacities):
+                scaled = pair_budget * capacity
+                count = scaled // max_pair_count
+                pair_counts[region_index] = count
+                allocated += count
+                remainders.append((scaled % max_pair_count, region_index))
+            for _, region_index in sorted(remainders, key=lambda item: (-item[0], item[1])):
+                if allocated >= pair_budget:
+                    break
+                if pair_counts[region_index] < pair_capacities[region_index]:
+                    pair_counts[region_index] += 1
+                    allocated += 1
+            if allocated != pair_budget:
+                raise RuntimeError("Unable to distribute the target-aware CTC coarse-frame budget.")
+
+        groups: List[Tuple[int, int]] = []
+        region_index = 0
+        for is_virtual, start, end in segments:
+            if is_virtual:
+                groups.append((start, end))
+                continue
+
+            pair_count = pair_counts[region_index]
+            region_index += 1
+            region_length = end - start
+            if region_length <= 2:
+                groups.extend((frame, frame + 1) for frame in range(start, end))
+                continue
+
+            groups.append((start, start + 1))
+            interior_length = region_length - 2
+            interior_group_count = interior_length - pair_count
+            interior_cursor = start + 1
+            for group_index in range(interior_group_count):
+                # Bresenham-style placement of the pair groups across this
+                # region's interior. A pair adds one extra acoustic frame.
+                use_pair = (
+                    ((group_index + 1) * pair_count) // interior_group_count
+                    > (group_index * pair_count) // interior_group_count
+                )
+                group_size = 2 if use_pair else 1
+                groups.append((interior_cursor, interior_cursor + group_size))
+                interior_cursor += group_size
+            if interior_cursor != end - 1:
+                raise RuntimeError("Target-aware CTC coarse groups did not partition an acoustic region.")
+            groups.append((end - 1, end))
+
+        if region_index != len(acoustic_regions):
+            raise RuntimeError("Target-aware CTC coarse groups lost an acoustic region.")
+        if sum(not bool(virtual_time_mask[start].item()) for start, _ in groups) < target_acoustic_groups:
+            raise RuntimeError("Target-aware CTC coarse groups retained too few acoustic frames.")
+        return groups
+
+    @staticmethod
+    def _expand_coarse_state_path(
+        *,
+        coarse_path: torch.Tensor,
+        groups: Sequence[Tuple[int, int]],
+        num_frames: int,
+    ) -> torch.Tensor:
+        """Expand one monotonic coarse path back to every compact CTC frame."""
+        if coarse_path.ndim != 1 or coarse_path.numel() != len(groups):
+            raise ValueError("coarse_path and groups must have the same length.")
+        state_centers = torch.empty(num_frames, dtype=torch.long)
+        expected_start = 0
+        for state, (start, end) in zip(coarse_path.tolist(), groups):
+            if start != expected_start or not start < end <= num_frames:
+                raise ValueError("Coarse timeline groups must partition the compact CTC timeline.")
+            state_centers[start:end] = int(state)
+            expected_start = end
+        if expected_start != num_frames:
+            raise ValueError("Coarse timeline groups do not cover the compact CTC timeline.")
+        return state_centers
+
+    @staticmethod
+    def _ctc_viterbi_dp_dense(
+        *,
+        emissions: torch.Tensor,
+        labels: torch.Tensor,
+        blank_id: int,
+    ) -> Tuple[torch.Tensor, float]:
+        """Run the original exact CTC Viterbi recurrence on one emission trellis."""
+        num_frames, num_states = emissions.shape
+        if num_states < 2:
+            raise ValueError("CTC target must contain at least blank and one token state.")
+        neg_inf = -float('inf')
+        previous_scores = torch.full((num_states,), neg_inf, dtype=torch.float32)
+        previous_scores[0] = emissions[0, 0]
+        previous_scores[1] = emissions[0, 1]
+        backpointers = torch.full((num_frames, num_states), -1, dtype=torch.long)
+        backpointers[0, 0] = 0
+        backpointers[0, 1] = 1
+        state_indices = torch.arange(num_states, dtype=torch.long)
+        can_skip = torch.zeros(num_states, dtype=torch.bool)
+        if num_states > 2:
+            can_skip[2:] = (labels[2:] != blank_id) & (labels[2:] != labels[:-2])
+
+        for frame_index in range(1, num_frames):
+            best_scores = previous_scores.clone()
+            best_previous_states = state_indices.clone()
+
+            advance_one_scores = torch.full((num_states,), neg_inf, dtype=torch.float32)
+            advance_one_scores[1:] = previous_scores[:-1]
+            take_advance_one = advance_one_scores > best_scores
+            best_scores = torch.where(take_advance_one, advance_one_scores, best_scores)
+            best_previous_states = torch.where(take_advance_one, state_indices - 1, best_previous_states)
+
+            if can_skip.any():
+                skip_scores = torch.full((num_states,), neg_inf, dtype=torch.float32)
+                skip_scores[can_skip] = previous_scores[state_indices[can_skip] - 2]
+                take_skip = skip_scores > best_scores
+                best_scores = torch.where(take_skip, skip_scores, best_scores)
+                best_previous_states = torch.where(take_skip, state_indices - 2, best_previous_states)
+
+            previous_scores = best_scores + emissions[frame_index]
+            backpointers[frame_index] = best_previous_states
+
+        final_state = num_states - 1
+        if previous_scores[num_states - 2] > previous_scores[final_state]:
+            final_state = num_states - 2
+        final_score = previous_scores[final_state]
+        if not torch.isfinite(final_score):
+            raise ValueError("No valid CTC Viterbi path exists for this transcript and audio.")
+
+        path = torch.empty((num_frames,), dtype=torch.long)
+        state = int(final_state)
+        for frame_index in range(num_frames - 1, -1, -1):
+            path[frame_index] = state
+            if frame_index > 0:
+                state = int(backpointers[frame_index, state].item())
+                if state < 0:
+                    raise RuntimeError("CTC Viterbi backtrace reached an invalid state.")
+        return path, float(final_score.item())
 
     def _word_rows_from_path(
         self,
@@ -2561,6 +4658,7 @@ class PEETransformerCTCTimestampExtractor:
             row = {
                 'word': word['word'],
                 'word_index': word['word_index'],
+                'turn_index': word.get('turn_index'),
                 'speaker_tag': speaker_tag,
                 'start': time_offset + start_frame * ctc_step_seconds,
                 'end': time_offset + (end_frame + 1) * ctc_step_seconds,
@@ -2682,6 +4780,23 @@ class PEETransformerCTCTimestampExtractor:
         return speaker_probs[lower] * (1.0 - fraction) + speaker_probs[upper] * fraction
 
     @staticmethod
+    def _normalize_coarse_alignment_band_size(value: Optional[int]) -> Optional[int]:
+        """Normalize an optional coarse-to-fine CTC target-state radius."""
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise TypeError("coarse_alignment_band_size must be an integer or None, not a boolean.")
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError) as error:
+            raise TypeError("coarse_alignment_band_size must be an integer or None.") from error
+        if normalized != value:
+            raise ValueError("coarse_alignment_band_size must be an integer or None.")
+        if normalized < 0:
+            raise ValueError("coarse_alignment_band_size must be non-negative or None.")
+        return normalized or None
+
+    @staticmethod
     def _validate_alignment_mode(mode: str) -> str:
         mode = str(mode).lower()
         if mode not in {'parallel', 'serialized'}:
@@ -2738,6 +4853,84 @@ class PEETransformerCTCTimestampExtractor:
         if not 0 < length <= maximum:
             raise ValueError(f"{name} must be in [1, {maximum}], got {length}.")
         return length
+
+    @staticmethod
+    def _validate_sot_transcripts(sot_transcripts: Sequence[str], batch_size: int) -> None:
+        """Validate one textual t-SOT target per padded tensor row."""
+        if isinstance(sot_transcripts, (str, bytes)) or not isinstance(sot_transcripts, Sequence):
+            raise TypeError("sot_transcripts must be a sequence of one string per batch item.")
+        if len(sot_transcripts) != batch_size:
+            raise ValueError(
+                f"sot_transcripts must contain {batch_size} entries, got {len(sot_transcripts)}."
+            )
+        invalid = [index for index, transcript in enumerate(sot_transcripts) if not isinstance(transcript, str)]
+        if invalid:
+            raise TypeError(f"sot_transcripts entries must be strings; invalid index/indices: {invalid}.")
+
+    @classmethod
+    def _select_batch_lengths(
+        cls,
+        values: Optional[Any],
+        batch_size: int,
+        maximum: int,
+        name: str,
+    ) -> List[int]:
+        """Validate a padded-batch length vector and return host integers."""
+        if batch_size <= 0 or maximum <= 0:
+            raise ValueError(f"{name} requires positive batch_size and maximum.")
+        if values is None:
+            return [maximum] * batch_size
+        if isinstance(values, torch.Tensor):
+            if values.ndim != 1 or values.shape[0] != batch_size:
+                raise ValueError(f"{name} must have shape ({batch_size},), got {tuple(values.shape)}.")
+            raw_values = values.detach().cpu().tolist()
+        else:
+            if isinstance(values, (str, bytes)) or not isinstance(values, Sequence) or len(values) != batch_size:
+                raise ValueError(f"{name} must contain exactly {batch_size} lengths.")
+            raw_values = list(values)
+        lengths = [cls._scalar_length(value, f"{name}[{index}]") for index, value in enumerate(raw_values)]
+        invalid = [length for length in lengths if not 0 < length <= maximum]
+        if invalid:
+            raise ValueError(f"{name} entries must be in [1, {maximum}], got {invalid}.")
+        return lengths
+
+    @staticmethod
+    def _select_optional_float_sequence(
+        values: Optional[Sequence[Optional[float]]],
+        batch_size: int,
+        name: str,
+    ) -> List[Optional[float]]:
+        """Normalize optional per-record metadata while rejecting NaNs."""
+        if values is None:
+            return [None] * batch_size
+        if isinstance(values, (str, bytes)) or not isinstance(values, Sequence) or len(values) != batch_size:
+            raise ValueError(f"{name} must contain exactly {batch_size} entries.")
+        normalized: List[Optional[float]] = []
+        for index, value in enumerate(values):
+            if value is None:
+                normalized.append(None)
+                continue
+            try:
+                numeric_value = float(value)
+            except (TypeError, ValueError) as error:
+                raise TypeError(f"{name}[{index}] must be a float or None.") from error
+            if not math.isfinite(numeric_value):
+                raise ValueError(f"{name}[{index}] must be finite, got {value!r}.")
+            normalized.append(numeric_value)
+        return normalized
+
+    @classmethod
+    def _select_float_sequence(
+        cls,
+        values: Optional[Sequence[float]],
+        batch_size: int,
+        name: str,
+        *,
+        default: float,
+    ) -> List[float]:
+        """Normalize required numeric batch metadata with a scalar default."""
+        optional_values = cls._select_optional_float_sequence(values, batch_size, name)
+        return [float(default) if value is None else value for value in optional_values]
 
     def _resolve_blank_id(self, ctc_vocab_size: int) -> int:
         """Validate the decoder/head blank convention against the supplied log-probs."""
