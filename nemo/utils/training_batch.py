@@ -81,14 +81,6 @@ def get_data_parallel_group(pl_module: LightningModule):
         trainer_model = getattr(trainer, "model", None)
         device_mesh = getattr(trainer_model, "device_mesh", None)
     if device_mesh is None:
-        try:
-            from megatron.core import parallel_state
-
-            if parallel_state.model_parallel_is_initialized():
-                return parallel_state.get_data_parallel_group(with_context_parallel=False)
-        except (AttributeError, ImportError, RuntimeError, TypeError):
-            # Megatron Core is optional or may not have initialized its groups yet.
-            pass
         return None
 
     names = device_mesh.mesh_dim_names or ()
