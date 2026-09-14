@@ -137,6 +137,10 @@ class TrainingStatsCallback(Callback):
         # Under CP/TP, batch broadcasting gives model-parallel ranks duplicate
         # data, so reducing over the full world would over-count.
         global_tokens, global_examples = reduce_batch_counts(local_tokens, local_examples, pl_module)
+        # OneLogger runs later in the normal SALM callback order and can reuse
+        # this exact reduction instead of adding another synchronization.
+        setattr(pl_module, "_last_batch_global_num_examples", int(global_examples))
+        setattr(pl_module, "_last_batch_stats_batch_token", getattr(pl_module, "_one_logger_batch_token", None))
 
         self.num_tokens_total += global_tokens
         self.num_examples_total += global_examples

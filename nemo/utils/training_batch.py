@@ -10,7 +10,13 @@ import torch
 import torch.distributed as dist
 from lightning.pytorch import LightningModule
 
-__all__ = ["get_data_parallel_group", "infer_batch_size", "reduce_batch_counts"]
+__all__ = [
+    "all_data_parallel_ranks_true",
+    "get_data_parallel_group",
+    "infer_batch_size",
+    "reduce_batch_counts",
+    "reduce_batch_size",
+]
 
 
 def infer_batch_size(batch: Any) -> int | None:
@@ -21,6 +27,12 @@ def infer_batch_size(batch: Any) -> int | None:
     produced. This helper therefore only inspects runtime data.
     """
     if isinstance(batch, Mapping):
+        text_cu_seqlens = batch.get("text_cu_seqlens")
+        if torch.is_tensor(text_cu_seqlens) and text_cu_seqlens.ndim == 1:
+            # Packed SALM text offsets describe logical conversations, while
+            # audio_lens describes audio segments and can therefore be larger.
+            return int(text_cu_seqlens.numel() - 1)
+
         combined = [batch.get(key) for key in ("audio_data", "text_data") if batch.get(key) is not None]
         if combined:
             sizes = [infer_batch_size(part) for part in combined]
@@ -116,3 +128,31 @@ def reduce_batch_counts(local_tokens: int, local_examples: int, pl_module: Light
     dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=get_data_parallel_group(pl_module))
     global_tokens, global_examples = counts.tolist()
     return int(global_tokens), int(global_examples)
+
+
+def all_data_parallel_ranks_true(value: bool, pl_module: LightningModule) -> bool:
+    """Return whether ``value`` is true on every data-parallel rank."""
+    if not (dist.is_available() and dist.is_initialized()):
+        return value
+    flag = torch.tensor(int(value), dtype=torch.long, device=pl_module.device)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=get_data_parallel_group(pl_module))
+    return bool(flag.item())
+
+
+def reduce_batch_size(local_examples: int | None, pl_module: LightningModule) -> int | None:
+    """Sum a batch size only when every data-parallel rank inferred one.
+
+    Every rank must call this helper, including ranks where inference failed,
+    so asymmetric batches cannot cause a collective deadlock.
+    """
+    valid = local_examples is not None and local_examples > 0
+    if not (dist.is_available() and dist.is_initialized()):
+        return int(local_examples) if valid else None
+
+    group = get_data_parallel_group(pl_module)
+    counts = torch.tensor([int(local_examples or 0), int(valid)], dtype=torch.long, device=pl_module.device)
+    dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=group)
+    global_examples, valid_ranks = counts.tolist()
+    if valid_ranks != dist.get_world_size(group=group) or global_examples <= 0:
+        return None
+    return int(global_examples)

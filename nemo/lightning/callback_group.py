@@ -95,9 +95,9 @@ class CallbackGroup:
         callbacks = [cb for cb in callbacks if self._should_attach(cb)]
         existing = [cb for cb in getattr(trainer, 'callbacks', []) if isinstance(cb, PTLCallback)]
         callback_types = {type(cb) for cb in existing}
-        callbacks = [
+        callbacks = existing + [
             cb for cb in callbacks if isinstance(cb, PTLCallback) and type(cb) not in callback_types
-        ] + existing
+        ]
 
         # Sanitize callback state_key for pickling safety
         for cb in callbacks:

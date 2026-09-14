@@ -31,6 +31,7 @@ from nemo.lightning.one_logger_callback import (
     OneLoggerNeMoCallback,
     _get_base_callback_config,
     _should_enable_for_current_rank,
+    _should_participate_on_current_rank,
     get_nemo_v1_callback_config,
     get_one_logger_init_config,
 )
@@ -56,7 +57,7 @@ class TestOneLoggerNeMoCallback:
             patch('nemo.lightning.one_logger_callback.TrainingTelemetryProvider') as mock_provider,
             patch('nemo.lightning.one_logger_callback.get_one_logger_init_config') as mock_get_config,
             patch('nemo.lightning.one_logger_callback.OneLoggerConfig') as mock_config_class,
-            patch('nemo.lightning.one_logger_callback.on_app_start') as mock_on_app_start,
+            patch('nemo.lightning.one_logger_callback.on_app_start'),
         ):
 
             # Setup mocks
@@ -147,6 +148,17 @@ class TestOneLoggerCallback:
             assert _should_enable_for_current_rank() is False
 
     @pytest.mark.unit
+    def test_explicit_disable_avoids_collective_participation(self):
+        with patch.dict(os.environ, {"RANK": "1", "NEMO_ONE_LOGGER_ENABLED": "0"}, clear=True):
+            assert _should_participate_on_current_rank() is False
+
+    @pytest.mark.unit
+    def test_non_exporting_distributed_rank_participates(self):
+        with patch.dict(os.environ, {"RANK": "1", "WORLD_SIZE": "2"}, clear=True):
+            assert _should_enable_for_current_rank() is False
+            assert _should_participate_on_current_rank() is True
+
+    @pytest.mark.unit
     def test_get_base_callback_config(self):
         """Test _get_base_callback_config with basic trainer setup."""
         trainer = MagicMock()
@@ -163,7 +175,7 @@ class TestOneLoggerCallback:
 
             assert config["perf_tag_or_fn"] == "test_job_1.0.0_bf32_se512_ws4"
             assert config["global_batch_size_or_fn"] == 32
-            assert config["micro_batch_size_or_fn"] == 8
+            assert "micro_batch_size_or_fn" not in config
             assert config["seq_length_or_fn"] == 512
             assert config["train_iterations_target_or_fn"] == 1000
             assert config["train_samples_target_or_fn"] == 32000
@@ -225,17 +237,13 @@ class TestOneLoggerCallback:
         """Runtime batch callables are used instead of train_ds batch-size hints."""
         trainer = MagicMock(max_steps=500, callbacks=[], strategy=None, log_every_n_steps=10)
         trainer.lightning_module.cfg = OmegaConf.create({"train_ds": {"batch_size": 8}})
-        current = {"global": 7, "local": 3}
+        current = {"global": 7}
 
         with patch.dict(os.environ, {"WORLD_SIZE": "2"}, clear=True):
-            config = get_nemo_v1_callback_config(
-                trainer,
-                global_batch_size=lambda: current["global"],
-                micro_batch_size=lambda: current["local"],
-            )
+            config = get_nemo_v1_callback_config(trainer, global_batch_size=lambda: current["global"])
 
         assert config["global_batch_size_or_fn"]() == 7
-        assert config["micro_batch_size_or_fn"]() == 3
+        assert "micro_batch_size_or_fn" not in config
         assert config["seq_length_or_fn"] is None
         assert config["train_samples_target_or_fn"] is None
         assert "_bf" not in config["perf_tag_or_fn"]
@@ -248,7 +256,7 @@ class TestOneLoggerCallback:
             {"train_ds": {"bucket_batch_size": [4, 8, 12], "bucket_duration_bins": [5, 10, 20]}}
         )
 
-        config = get_nemo_v1_callback_config(trainer, global_batch_size=lambda: 4, micro_batch_size=lambda: 4)
+        config = get_nemo_v1_callback_config(trainer, global_batch_size=lambda: 4)
 
         assert callable(config["global_batch_size_or_fn"])
         assert config["global_batch_size_or_fn"]() == 4
@@ -269,7 +277,6 @@ class TestOneLoggerCallback:
         env = {
             "WORLD_SIZE": "4",
             "NEMO_ONE_LOGGER_GLOBAL_BATCH_SIZE": "16",
-            "NEMO_ONE_LOGGER_MICRO_BATCH_SIZE": "4",
             "NEMO_ONE_LOGGER_SEQUENCE_LENGTH": "256",
         }
 
@@ -277,7 +284,7 @@ class TestOneLoggerCallback:
             config = get_nemo_v1_callback_config(trainer)
 
         assert config["global_batch_size_or_fn"] == 16
-        assert config["micro_batch_size_or_fn"] == 4
+        assert "micro_batch_size_or_fn" not in config
         assert config["seq_length_or_fn"] == 256
         assert config["train_samples_target_or_fn"] == 1600
 
@@ -382,6 +389,18 @@ class TestOneLoggerCallback:
         group.attach_to_trainer(trainer)
 
         assert trainer.callbacks == [callback]
+
+    @pytest.mark.unit
+    def test_callback_group_appends_telemetry_after_existing_callbacks(self):
+        group = CallbackGroup.__new__(CallbackGroup)
+        telemetry = BaseCallback()
+        existing = PTLCallback()
+        group._callbacks = [telemetry]
+        trainer = SimpleNamespace(callbacks=[existing])
+
+        group.attach_to_trainer(trainer)
+
+        assert trainer.callbacks == [existing, telemetry]
 
     @pytest.mark.unit
     def test_disabled_callback_is_not_attached(self):
@@ -504,6 +523,7 @@ class TestOneLoggerCallback:
         group.on_save_checkpoint_success.assert_not_called()
         group.on_save_checkpoint_end.assert_called_once_with()
 
+    @patch('nemo.lightning.one_logger_callback.reduce_batch_size', side_effect=lambda examples, _m: examples)
     @patch('nemo.lightning.one_logger_callback.on_training_single_iteration_end')
     @patch('nemo.lightning.one_logger_callback.on_training_single_iteration_start')
     @patch('nemo.lightning.one_logger_callback.on_train_start')
@@ -524,6 +544,7 @@ class TestOneLoggerCallback:
         mock_train_start,
         mock_iteration_start,
         mock_iteration_end,
+        mock_reduce_batch_size,
     ):
         mock_get_init_config.return_value = {"application_name": "nemo-speech", "enable_for_current_rank": True}
         provider = MagicMock()
@@ -540,18 +561,30 @@ class TestOneLoggerCallback:
 
         first_batch = {"input_signal": torch.zeros(2, 20), "input_signal_length": torch.tensor([20, 15])}
         callback.on_train_batch_start(trainer, module, first_batch, 0)
+        trainer.global_step = 5  # Lightning increments before on_train_batch_end.
         callback.on_train_batch_end(trainer, module, None, first_batch, 0)
         configured = mock_training_config_class.call_args.kwargs
         assert configured["global_batch_size_or_fn"]() == 2
-        assert configured["micro_batch_size_or_fn"]() == 2
+        assert "micro_batch_size_or_fn" not in configured
         assert configured["seq_length_or_fn"] is None
         assert configured["train_samples_target_or_fn"] is None
 
         second_batch = {"input_signal": torch.zeros(3, 20), "input_signal_length": torch.tensor([20, 15, 10])}
+        callback._reuse_training_stats = True
         callback.on_train_batch_start(trainer, module, second_batch, 1)
+        module._last_batch_stats_batch_token = module._one_logger_batch_token
+        module._last_batch_global_num_examples = 3
         callback.on_train_batch_end(trainer, module, None, second_batch, 1)
 
         assert configured["global_batch_size_or_fn"]() == 3
+        assert callback.num_samples_total == 14
+
+        # Without shared TrainingStats, a rank that cannot infer the next
+        # batch still joins the reduction. The failure is not counted as stale.
+        callback._reuse_training_stats = False
+        unknown_batch = {"input_ids": torch.arange(10)}
+        callback.on_train_batch_start(trainer, module, unknown_batch, 2)
+        callback.on_train_batch_end(trainer, module, None, unknown_batch, 2)
         assert callback.num_samples_total == 14
         mock_train_start.assert_called_once_with(
             train_iterations_start=4,
@@ -560,6 +593,8 @@ class TestOneLoggerCallback:
         )
         assert mock_iteration_start.call_count == 2
         assert mock_iteration_end.call_count == 2
+        assert mock_reduce_batch_size.call_count == 2
+        assert mock_reduce_batch_size.call_args_list[-1].args == (None, module)
 
     def test_export_all_symbols(self):
         """Test that __all__ contains the expected symbols."""

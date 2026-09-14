@@ -42,7 +42,7 @@ from nv_one_logger.training_telemetry.api.training_telemetry_provider import Tra
 from nv_one_logger.training_telemetry.integration.pytorch_lightning import TimeEventCallback as OneLoggerPTLCallback
 
 from nemo.lightning.base_callback import BaseCallback
-from nemo.utils.training_batch import infer_batch_size, reduce_batch_counts
+from nemo.utils.training_batch import all_data_parallel_ranks_true, infer_batch_size, reduce_batch_size
 
 # Export all symbols for testing and usage
 __all__ = ["OneLoggerNeMoCallback"]
@@ -137,7 +137,6 @@ def _get_base_callback_config(
     trainer: Any,
     global_batch_size: Any,
     seq_length: int | None,
-    micro_batch_size: Any = None,
 ) -> dict[str, Any]:
     """Build telemetry config from measured work or explicit fixed overrides."""
     job_name = _get_job_name()
@@ -147,8 +146,6 @@ def _get_base_callback_config(
     fixed_global_batch_size = _as_positive_int(global_batch_size) if not callable(global_batch_size) else None
     if fixed_global_batch_size is None and not callable(global_batch_size):
         raise ValueError("OneLogger global batch size must be measured at runtime or explicitly configured")
-    if micro_batch_size is None and fixed_global_batch_size is not None:
-        micro_batch_size = max(fixed_global_batch_size // world_size, 1)
     seq_length = _as_positive_int(seq_length)
 
     perf_version_tag = os.environ.get("PERF_VERSION_TAG", "0.0.0")
@@ -174,7 +171,6 @@ def _get_base_callback_config(
     return {
         "perf_tag_or_fn": os.environ.get("NEMO_ONE_LOGGER_PERF_TAG", default_perf_tag),
         "global_batch_size_or_fn": global_batch_size,
-        "micro_batch_size_or_fn": micro_batch_size,
         # OneLogger derives cumulative tokens as current sequence length times
         # cumulative samples. That is correct only for an explicitly fixed length.
         "seq_length_or_fn": seq_length,
@@ -196,7 +192,6 @@ def _get_base_callback_config(
 def get_nemo_v1_callback_config(
     trainer: Any,
     global_batch_size: Any = None,
-    micro_batch_size: Any = None,
 ) -> dict[str, Any]:
     """Generate OneLogger config without guessing from speech sampler budgets.
 
@@ -206,31 +201,16 @@ def get_nemo_v1_callback_config(
     fixed values are explicitly provided through the legacy environment knobs.
     """
     fixed_global_batch_size = _get_env_positive_int("NEMO_ONE_LOGGER_GLOBAL_BATCH_SIZE")
-    fixed_micro_batch_size = _get_env_positive_int("NEMO_ONE_LOGGER_MICRO_BATCH_SIZE")
     global_batch_size = fixed_global_batch_size or global_batch_size
-    micro_batch_size = fixed_micro_batch_size or micro_batch_size
     return _get_base_callback_config(
         trainer=trainer,
         global_batch_size=global_batch_size,
-        micro_batch_size=micro_batch_size,
         seq_length=_get_env_positive_int("NEMO_ONE_LOGGER_SEQUENCE_LENGTH"),
     )
 
 
-def _should_enable_for_current_rank() -> bool:
-    """Determine if OneLogger should be enabled for the current rank.
-
-    Uses environment variables instead of torch.distributed to avoid circular imports.
-    In distributed training, typically only rank 0 (or the last rank) should
-    enable OneLogger to avoid duplicate telemetry data.
-
-    Returns:
-        True if OneLogger should be enabled for the current rank, False otherwise
-    """
-    enabled = os.environ.get("NEMO_ONE_LOGGER_ENABLED")
-    if enabled is not None and enabled.lower() in {"0", "false", "no", "off"}:
-        return False
-
+def _get_rank() -> int | None:
+    """Resolve a global rank from torchrun, Slurm, or Lightning launcher metadata."""
     rank = _get_env_int("RANK")
     if rank is None:
         rank = _get_env_int("SLURM_PROCID")
@@ -240,18 +220,34 @@ def _should_enable_for_current_rank() -> bool:
             node_rank = _get_env_int("NODE_RANK") or 0
             local_world_size = _get_env_positive_int("LOCAL_WORLD_SIZE") or 1
             rank = node_rank * local_world_size + local_rank
+    return rank
+
+
+def _is_explicitly_disabled() -> bool:
+    enabled = os.environ.get("NEMO_ONE_LOGGER_ENABLED")
+    return enabled is not None and enabled.lower() in {"0", "false", "no", "off"}
+
+
+def _should_enable_for_current_rank() -> bool:
+    """Return whether this process should export OneLogger telemetry."""
+    if _is_explicitly_disabled():
+        return False
+    rank = _get_rank()
     if rank is None:
+        enabled = os.environ.get("NEMO_ONE_LOGGER_ENABLED")
         return enabled is not None and enabled.lower() in {"1", "true", "yes", "on"}
     return rank == 0
+
+
+def _should_participate_on_current_rank() -> bool:
+    """Return whether this rank must join dynamic batch-count collectives."""
+    return not _is_explicitly_disabled() and (_get_rank() is not None or _should_enable_for_current_rank())
 
 
 class OneLoggerNeMoCallback(OneLoggerPTLCallback, BaseCallback):
     """OneLogger adapter with exact runtime accounting for dynamic speech batches."""
 
     _instance = None
-    # Every DP rank must participate in the batch-size reduction. Only the
-    # enabled rank emits OneLogger events.
-    participates_on_all_ranks = True
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
@@ -263,6 +259,7 @@ class OneLoggerNeMoCallback(OneLoggerPTLCallback, BaseCallback):
             return
         init_config = get_one_logger_init_config()
         self.enabled_for_current_rank = init_config.get("enable_for_current_rank", True)
+        self.participates_on_all_ranks = _should_participate_on_current_rank()
         one_logger_config = OneLoggerConfig(**init_config)
         provider = TrainingTelemetryProvider.instance()
         provider.with_base_config(one_logger_config).with_export_config().configure_provider()
@@ -273,14 +270,15 @@ class OneLoggerNeMoCallback(OneLoggerPTLCallback, BaseCallback):
 
         self.num_samples_total = 0
         self._current_global_batch_size = 0
-        self._current_micro_batch_size = 0
         self._train_start_time_msec = None
         self._batch_start_time_msec = None
+        self._batch_token = 0
+        self._train_iterations_start = 0
+        self._reuse_training_stats = False
         self._training_started = False
         self._iteration_started = False
         self._configured = self._provider.config.telemetry_config is not None
         self._fixed_global_batch_size = _get_env_positive_int("NEMO_ONE_LOGGER_GLOBAL_BATCH_SIZE")
-        self._fixed_micro_batch_size = _get_env_positive_int("NEMO_ONE_LOGGER_MICRO_BATCH_SIZE")
         self._initialized = True
 
     def state_dict(self) -> dict[str, Any]:
@@ -291,6 +289,17 @@ class OneLoggerNeMoCallback(OneLoggerPTLCallback, BaseCallback):
 
     def setup(self, trainer: Trainer, pl_module: Any, stage: str) -> None:
         if stage == "fit":
+            if self._fixed_global_batch_size is None:
+                callbacks = list(getattr(trainer, "callbacks", ()))
+                callback_index = callbacks.index(self) if self in callbacks else 0
+                stats_runs_first = any(
+                    type(cb).__module__ == "nemo.utils.callbacks.training_stats"
+                    and type(cb).__name__ == "TrainingStatsCallback"
+                    for cb in callbacks[:callback_index]
+                )
+                # One consensus at setup guarantees every rank takes the same
+                # per-batch path: reuse TrainingStats, or perform our own reduction.
+                self._reuse_training_stats = all_data_parallel_ranks_true(stats_runs_first, pl_module)
             self.update_config(nemo_version="lightning", trainer=trainer)
 
     def update_config(self, nemo_version: str, trainer: Trainer, **kwargs) -> None:
@@ -300,44 +309,44 @@ class OneLoggerNeMoCallback(OneLoggerPTLCallback, BaseCallback):
             return
         if self._fixed_global_batch_size is not None:
             self._current_global_batch_size = self._fixed_global_batch_size
-            self._current_micro_batch_size = self._fixed_micro_batch_size or max(
-                self._fixed_global_batch_size // _get_world_size(), 1
-            )
             self._configure(trainer, fixed=True)
 
     def _configure(self, trainer: Trainer, fixed: bool = False) -> None:
         if self._configured:
             return
         global_batch_size = self._fixed_global_batch_size if fixed else lambda: self._current_global_batch_size
-        micro_batch_size = self._fixed_micro_batch_size or (None if fixed else lambda: self._current_micro_batch_size)
         config = get_nemo_v1_callback_config(
             trainer=trainer,
             global_batch_size=global_batch_size,
-            micro_batch_size=micro_batch_size,
         )
         self._provider.set_training_telemetry_config(TrainingTelemetryConfig(**config))
         self._configured = True
 
-    def _measure_batch(self, batch: Any, pl_module: Any, prefer_model_count: bool) -> bool:
-        local_examples = None
-        if prefer_model_count:
+    def _measure_batch(self, batch: Any, pl_module: Any) -> bool:
+        if self._reuse_training_stats:
+            marker_matches = getattr(pl_module, "_last_batch_stats_batch_token", None) == self._batch_token
+            global_examples = (
+                _as_positive_int(getattr(pl_module, "_last_batch_global_num_examples", None))
+                if marker_matches
+                else None
+            )
+        else:
             local_examples = _as_positive_int(getattr(pl_module, "_last_batch_num_examples", None))
-        if local_examples is None:
-            local_examples = infer_batch_size(batch)
-        if local_examples is None or local_examples <= 0:
+            if local_examples is None:
+                local_examples = infer_batch_size(batch)
+            # Every DP rank enters this collective, even when local inference
+            # failed, preventing asymmetric batch structures from deadlocking.
+            global_examples = reduce_batch_size(local_examples, pl_module)
+        if global_examples is None or global_examples <= 0:
             return False
-        _, global_examples = reduce_batch_counts(0, local_examples, pl_module)
-        if global_examples <= 0:
-            return False
-        self._current_micro_batch_size = local_examples
         self._current_global_batch_size = global_examples
         return True
 
-    def _start_training(self, trainer: Trainer) -> None:
+    def _start_training(self) -> None:
         if self._training_started or not self._configured or not self.enabled_for_current_rank:
             return
         on_train_start(
-            train_iterations_start=trainer.global_step,
+            train_iterations_start=self._train_iterations_start,
             train_samples_start=self.num_samples_total,
             start_time_msec=self._train_start_time_msec,
         )
@@ -345,28 +354,34 @@ class OneLoggerNeMoCallback(OneLoggerPTLCallback, BaseCallback):
 
     def on_train_start(self, trainer: Trainer, pl_module: Any) -> None:
         self._train_start_time_msec = time.time() * 1000
+        self._train_iterations_start = trainer.global_step
         if self._fixed_global_batch_size is not None:
-            self._start_training(trainer)
+            self._start_training()
 
     def on_train_batch_start(self, trainer: Trainer, pl_module: Any, batch: Any, batch_idx: int) -> None:
-        del batch_idx
+        del batch, batch_idx
         self._batch_start_time_msec = time.time() * 1000
-        if self._fixed_global_batch_size is None and self._measure_batch(batch, pl_module, prefer_model_count=False):
-            self._configure(trainer)
-        self._start_training(trainer)
-        if self._training_started:
-            on_training_single_iteration_start(start_time_msec=self._batch_start_time_msec)
-            self._iteration_started = True
+        self._batch_token += 1
+        setattr(pl_module, "_one_logger_batch_token", self._batch_token)
+        setattr(pl_module, "_last_batch_stats_batch_token", None)
+        if self._fixed_global_batch_size is not None:
+            self._start_training()
+            if self._training_started:
+                on_training_single_iteration_start(start_time_msec=self._batch_start_time_msec)
+                self._iteration_started = True
 
     def on_train_batch_end(self, trainer: Trainer, pl_module: Any, outputs: Any, batch: Any, batch_idx: int) -> None:
         """Finish telemetry for a measured training batch."""
         del outputs, batch_idx
         if self._fixed_global_batch_size is None:
-            measured = self._measure_batch(batch, pl_module, prefer_model_count=True)
-            if measured and not self._configured:
+            if not self._measure_batch(batch, pl_module):
+                return
+            if not self._configured:
                 self._configure(trainer)
-        self._start_training(trainer)
+        self._start_training()
         if self._training_started and not self._iteration_started:
+            # Dynamic batch sizes are known only now. Preserve the true start
+            # timestamp while avoiding an open span if measurement fails.
             on_training_single_iteration_start(start_time_msec=self._batch_start_time_msec)
             self._iteration_started = True
         if self._iteration_started:
