@@ -394,7 +394,7 @@ class TestOneLoggerCallback:
     def test_modelpt_subclass_init_emits_one_paired_span(self):
         class ParentModel(ModelPT):
             def __init__(self):
-                pass
+                super().__init__(cfg=OmegaConf.create({}))
 
             @classmethod
             def list_available_models(cls):
@@ -434,11 +434,15 @@ class TestOneLoggerCallback:
     @pytest.mark.unit
     def test_callback_context_always_emits_end(self):
         group = MagicMock()
+        error = None
         with patch('nemo.lightning.callback_group.CallbackGroup.get_instance', return_value=group):
-            with pytest.raises(RuntimeError, match="boom"):
+            try:
                 with callback_context('on_model_init_start', 'on_model_init_end'):
                     raise RuntimeError("boom")
+            except RuntimeError as caught_error:
+                error = caught_error
 
+        assert str(error) == "boom"
         group.on_model_init_start.assert_called_once_with()
         group.on_model_init_end.assert_called_once_with()
 

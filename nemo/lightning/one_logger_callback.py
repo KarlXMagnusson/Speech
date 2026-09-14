@@ -251,7 +251,7 @@ def get_nemo_v1_callback_config(trainer: Any) -> Dict[str, Any]:
         try:
             data_parallel_size = int(get_data_parallel_size())
         except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
-            pass
+            data_parallel_size = _get_world_size()
 
     global_batch_size = _get_env_positive_int('NEMO_ONE_LOGGER_GLOBAL_BATCH_SIZE')
     if global_batch_size is None:
