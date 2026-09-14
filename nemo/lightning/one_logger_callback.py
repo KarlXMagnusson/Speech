@@ -359,6 +359,7 @@ class OneLoggerNeMoCallback(OneLoggerPTLCallback, BaseCallback):
             self._iteration_started = True
 
     def on_train_batch_end(self, trainer: Trainer, pl_module: Any, outputs: Any, batch: Any, batch_idx: int) -> None:
+        """Finish telemetry for a measured training batch."""
         del outputs, batch_idx
         if self._fixed_global_batch_size is None:
             measured = self._measure_batch(batch, pl_module, prefer_model_count=True)
@@ -407,6 +408,7 @@ class OneLoggerNeMoCallback(OneLoggerPTLCallback, BaseCallback):
         batch_idx: int,
         dataloader_idx: int = 0,
     ) -> None:
+        """Finish validation batch telemetry after training configuration exists."""
         if self._configured and self.enabled_for_current_rank:
             super().on_validation_batch_end(trainer, pl_module, outputs, batch, batch_idx, dataloader_idx)
 
