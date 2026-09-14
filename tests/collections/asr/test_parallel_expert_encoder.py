@@ -1391,3 +1391,139 @@ def test_timestamp_extractor_batch_applies_speaker_count_policy_per_record(monke
     assert [result["alignment_mode"] for result in results] == ["serialized", "parallel"]
     assert results[0]["speaker_tag_to_sortformer_column"] == {0: None, 1: None, 2: None}
     assert results[1]["speaker_tag_to_sortformer_column"] == {4: 1}
+
+
+@pytest.mark.unit
+def test_timestamp_extractor_retries_lower_parallel_gate_before_serializing(monkeypatch):
+    """A capacity-limited speaker retries at a lower gate and stays parallel."""
+    blank_id = 2
+
+    def tokenize_words(words, blank, *, alignment_mode):
+        assert blank == blank_id
+        return [dict(word, token_ids=[0]) for word in words]
+
+    logits = torch.full((5, blank_id + 1), -12.0)
+    for frame_index, label in enumerate([blank_id, 0, blank_id, 0, blank_id]):
+        logits[frame_index, label] = 12.0
+    extractor = PEETransformerCTCTimestampExtractor(
+        blank_id=blank_id,
+        alignment_mode="parallel",
+        speaker_logprob_weight=0.0,
+        parallel_speaker_gate_threshold=0.5,
+        parallel_speaker_gate_min_threshold=0.2,
+        parallel_active_region_padding_seconds=0.0,
+        parallel_active_region_merge_gap_seconds=0.0,
+    )
+    monkeypatch.setattr(extractor, "_tokenize_words", tokenize_words)
+
+    result = extractor.extract_from_outputs(
+        ctc_log_probs=torch.log_softmax(logits, dim=-1),
+        sortformer_sigmoids=torch.tensor([[0.9], [0.9], [0.4], [0.4], [0.0]]),
+        sot_transcript="<spk:0> a a",
+        alignment_mode="parallel",
+    )
+
+    assert result["requested_alignment_mode"] == "parallel"
+    assert result["alignment_mode"] == "parallel"
+    assert result["speaker_tag_to_sortformer_column"] == {0: 0}
+    retry = result["alignment_diagnostics"]["parallel_active_regions"][0]["adaptive_gate_retry"]
+    assert retry["attempted_thresholds"] == [0.5, 0.4]
+    assert retry["selected_threshold"] == 0.4
+    assert retry["gate_floor"] == 0.2
+    assert result["alignment_diagnostics"]["alignment_fallback"] is None
+    assert [row["word"] for row in result["speaker_word_timestamps"][0]] == ["a", "a"]
+
+
+@pytest.mark.unit
+def test_timestamp_extractor_serializes_after_parallel_gate_floor(monkeypatch):
+    """No full parallel timeline is opened when a speaker still has no CTC path at the floor."""
+    blank_id = 2
+    token_ids = {"a": 0, "b": 1}
+
+    def tokenize_words(words, blank, *, alignment_mode):
+        assert blank == blank_id
+        return [dict(word, token_ids=[token_ids[word["word"]]]) for word in words]
+
+    # The active timeline contains only the first two CTC frames at every gate
+    # in [0.5, 0.4, 0.3, 0.25, 0.2], so token b has no valid parallel path.
+    # The complete serialized transcript can reach b at frame three.
+    ctc_log_probs = torch.full((5, blank_id + 1), float("-inf"))
+    for frame_index, label in enumerate([blank_id, 0, 0, 1, blank_id]):
+        ctc_log_probs[frame_index, label] = 0.0
+    extractor = PEETransformerCTCTimestampExtractor(
+        blank_id=blank_id,
+        alignment_mode="parallel",
+        speaker_logprob_weight=0.0,
+        parallel_speaker_gate_threshold=0.5,
+        parallel_speaker_gate_min_threshold=0.2,
+        parallel_active_region_padding_seconds=0.0,
+        parallel_active_region_merge_gap_seconds=0.0,
+    )
+    monkeypatch.setattr(extractor, "_tokenize_words", tokenize_words)
+
+    result = extractor.extract_from_outputs(
+        ctc_log_probs=ctc_log_probs,
+        sortformer_sigmoids=torch.tensor([[0.9], [0.9], [0.1], [0.1], [0.1]]),
+        sot_transcript="<spk:0> a b",
+        alignment_mode="parallel",
+    )
+
+    assert result["requested_alignment_mode"] == "parallel"
+    assert result["alignment_mode"] == "serialized"
+    assert result["speaker_tag_to_sortformer_column"] == {0: None}
+    fallback = result["alignment_diagnostics"]["alignment_fallback"]
+    assert fallback["from_alignment_mode"] == "parallel"
+    assert fallback["to_alignment_mode"] == "serialized"
+    assert fallback["reason"] == "no_valid_ctc_viterbi_path_in_active_regions"
+    assert fallback["attempted_gate_thresholds"] == {"0": [0.5, 0.4, 0.3, 0.25, 0.2]}
+    assert fallback["gate_floor"] == 0.2
+    assert [row["word"] for row in result["speaker_word_timestamps"][0]] == ["a", "b"]
+
+
+@pytest.mark.unit
+def test_timestamp_extractor_batch_retries_or_serializes_per_record(monkeypatch):
+    """A terminal fallback in one batch item leaves the healthy item parallel."""
+    blank_id = 2
+    token_ids = {"a": 0, "b": 1}
+
+    def tokenize_words(words, blank, *, alignment_mode):
+        assert blank == blank_id
+        return [dict(word, token_ids=[token_ids[word["word"]]]) for word in words]
+
+    retry_logits = torch.full((5, blank_id + 1), -12.0)
+    for frame_index, label in enumerate([blank_id, 0, blank_id, 0, blank_id]):
+        retry_logits[frame_index, label] = 12.0
+    floor_logits = torch.full((5, blank_id + 1), float("-inf"))
+    for frame_index, label in enumerate([blank_id, 0, 0, 1, blank_id]):
+        floor_logits[frame_index, label] = 0.0
+
+    extractor = PEETransformerCTCTimestampExtractor(
+        blank_id=blank_id,
+        alignment_mode="parallel",
+        speaker_logprob_weight=0.0,
+        parallel_speaker_gate_threshold=0.5,
+        parallel_speaker_gate_min_threshold=0.2,
+        parallel_active_region_padding_seconds=0.0,
+        parallel_active_region_merge_gap_seconds=0.0,
+    )
+    monkeypatch.setattr(extractor, "_tokenize_words", tokenize_words)
+    results = extractor.extract_from_outputs_batch(
+        ctc_log_probs=torch.stack([torch.log_softmax(retry_logits, dim=-1), floor_logits]),
+        sortformer_sigmoids=torch.tensor(
+            [
+                [[0.9], [0.9], [0.4], [0.4], [0.0]],
+                [[0.9], [0.9], [0.1], [0.1], [0.1]],
+            ]
+        ),
+        sot_transcripts=["<spk:0> a a", "<spk:0> a b"],
+        ctc_lengths=torch.tensor([5, 5]),
+        sortformer_lengths=torch.tensor([5, 5]),
+        alignment_mode="parallel",
+    )
+
+    assert [result["alignment_mode"] for result in results] == ["parallel", "serialized"]
+    assert results[0]["alignment_diagnostics"]["parallel_active_regions"][0]["adaptive_gate_retry"][
+        "selected_threshold"
+    ] == 0.4
+    assert results[1]["alignment_diagnostics"]["alignment_fallback"]["to_alignment_mode"] == "serialized"
+    assert [row["word"] for row in results[1]["speaker_word_timestamps"][0]] == ["a", "b"]

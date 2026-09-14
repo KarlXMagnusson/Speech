@@ -189,6 +189,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--parallel-speaker-gate-min-threshold",
+        type=float,
+        default=0.20,
+        help=(
+            "Lowest automatic active-region retry threshold (default: 0.20). "
+            "A failed speaker retries at lower gates, then the recording uses serialized t-SOT CTC."
+        ),
+    )
+    parser.add_argument(
         "--parallel-active-region-padding-seconds",
         type=float,
         default=0.16,
@@ -865,6 +874,8 @@ def main() -> int:
         raise ValueError("--parallel-speaker-gate-threshold must be between zero and one, or negative to disable.")
     else:
         parallel_gate_threshold = args.parallel_speaker_gate_threshold
+    if not 0.0 <= args.parallel_speaker_gate_min_threshold <= 1.0:
+        raise ValueError("--parallel-speaker-gate-min-threshold must be between zero and one.")
     if args.parallel_active_region_padding_seconds < 0.0:
         raise ValueError("--parallel-active-region-padding-seconds must be non-negative.")
     if args.parallel_active_region_merge_gap_seconds < 0.0:
@@ -892,6 +903,7 @@ def main() -> int:
         speaker_assignment_mode=args.speaker_assignment_mode,
         speaker_logprob_weight=args.speaker_logprob_weight,
         parallel_speaker_gate_threshold=parallel_gate_threshold,
+        parallel_speaker_gate_min_threshold=args.parallel_speaker_gate_min_threshold,
         parallel_active_region_padding_seconds=args.parallel_active_region_padding_seconds,
         parallel_active_region_merge_gap_seconds=args.parallel_active_region_merge_gap_seconds,
         coarse_alignment_band_size=coarse_alignment_band_size,

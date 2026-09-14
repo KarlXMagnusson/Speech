@@ -99,6 +99,28 @@ class _NoValidCTCViterbiPathError(ValueError):
         )
 
 
+class _ParallelActiveRegionError(ValueError):
+    """Expose speaker streams whose compact Sortformer region cannot be planned."""
+
+    def __init__(
+        self,
+        failed_speaker_tags: Sequence[Optional[int]],
+        *,
+        reason: str,
+        details: Optional[Mapping[Optional[int], Mapping[str, Any]]] = None,
+    ) -> None:
+        speaker_tags = tuple(failed_speaker_tags)
+        if not speaker_tags:
+            raise ValueError("An active-region error requires at least one speaker tag.")
+        self.failed_speaker_tags = speaker_tags
+        self.reason = str(reason)
+        self.details = {speaker_tag: dict(value) for speaker_tag, value in (details or {}).items()}
+        super().__init__(
+            "Parallel active-region planning failed for speaker tag(s) "
+            f"{list(speaker_tags)} ({self.reason}). Lower the active-region threshold or use serialized alignment."
+        )
+
+
 def _disable_max_seq_length_sync(module: nn.Module) -> None:
     """Disable feature-length collectives in every encoder below ``module``."""
     for submodule in module.modules():
@@ -1193,6 +1215,10 @@ class PEETransformerCTCTimestampExtractor:
             remains available to CTC token emissions and is weighted by the soft
             Sortformer prior. Long inactive gaps become explicit word-boundary
             separators. Set ``None`` to use the unrestricted CTC timeline.
+        parallel_speaker_gate_min_threshold: Lowest automatic retry threshold for
+            a parallel active region. A failing speaker retries at progressively
+            lower thresholds down to this floor; if it remains infeasible, the
+            entire recording falls back to serialized t-SOT CTC alignment.
         parallel_active_region_padding_seconds: Context added on both sides of a
             selected Sortformer speech region; it remains available for CTC
             onset/offset evidence at active-region boundaries.
@@ -1227,6 +1253,7 @@ class PEETransformerCTCTimestampExtractor:
         speaker_activity_threshold: float = 0.5,
         speaker_logprob_weight: float = 0.25,
         parallel_speaker_gate_threshold: Optional[float] = 0.5,
+        parallel_speaker_gate_min_threshold: float = 0.20,
         parallel_active_region_padding_seconds: float = 0.16,
         parallel_active_region_merge_gap_seconds: float = 0.40,
         coarse_alignment_band_size: Optional[int] = None,
@@ -1246,6 +1273,8 @@ class PEETransformerCTCTimestampExtractor:
             raise ValueError("speaker_logprob_weight must be non-negative.")
         if parallel_speaker_gate_threshold is not None and not 0.0 <= float(parallel_speaker_gate_threshold) <= 1.0:
             raise ValueError("parallel_speaker_gate_threshold must be between zero and one or None.")
+        if not 0.0 <= float(parallel_speaker_gate_min_threshold) <= 1.0:
+            raise ValueError("parallel_speaker_gate_min_threshold must be between zero and one.")
         if parallel_active_region_padding_seconds < 0:
             raise ValueError("parallel_active_region_padding_seconds must be non-negative.")
         if parallel_active_region_merge_gap_seconds < 0:
@@ -1266,6 +1295,7 @@ class PEETransformerCTCTimestampExtractor:
         self.parallel_speaker_gate_threshold = (
             None if parallel_speaker_gate_threshold is None else float(parallel_speaker_gate_threshold)
         )
+        self.parallel_speaker_gate_min_threshold = float(parallel_speaker_gate_min_threshold)
         self.parallel_active_region_padding_seconds = float(parallel_active_region_padding_seconds)
         self.parallel_active_region_merge_gap_seconds = float(parallel_active_region_merge_gap_seconds)
         self.coarse_alignment_band_size = coarse_alignment_band_size
@@ -1779,6 +1809,8 @@ class PEETransformerCTCTimestampExtractor:
                 'ctc_log_normalizer_error': ctc_log_normalizer_error,
                 'alignment_diagnostics': {
                     'speaker_count_policy': speaker_count_policy,
+                    'parallel_speaker_gate_min_threshold': self.parallel_speaker_gate_min_threshold,
+                    'alignment_fallback': None,
                     'coarse_alignment_band_size': self.coarse_alignment_band_size,
                 },
             }
@@ -1855,6 +1887,8 @@ class PEETransformerCTCTimestampExtractor:
         alignment_scores: Dict[Optional[int], float] = {}
         final_coarse_diagnostics: Dict[Optional[int], Dict[str, Any]] = {}
         parallel_active_region_diagnostics: Dict[Optional[int], Dict[str, Any]] = {}
+        alignment_fallback: Optional[Dict[str, Any]] = None
+        parallel_retry_state: Optional[Dict[str, Any]] = None
         if mode == 'serialized':
             rows, path_score, final_coarse_diagnostic = self._align_word_sequence(
                 tokenized_words=tokenized_words,
@@ -1870,67 +1904,113 @@ class PEETransformerCTCTimestampExtractor:
             alignment_scores[None] = path_score
             final_coarse_diagnostics[None] = final_coarse_diagnostic
         else:
-            parallel_timelines, parallel_active_region_diagnostics = self._build_parallel_active_timelines(
-                tokenized_words=tokenized_words,
-                speaker_mapping=speaker_mapping,
-                speaker_probs=sortformer_for_alignment,
-                ctc_num_frames=ctc.shape[0],
-                ctc_step_seconds=ctc_step_seconds,
-                active_threshold=parallel_gate_threshold,
+            parallel_retry_state = self._new_parallel_gate_retry_state(
+                tokenized_words,
+                parallel_gate_threshold,
+            )
+            parallel_timelines, parallel_active_region_diagnostics, terminal_failure = (
+                self._build_parallel_active_timelines_with_retries(
+                    tokenized_words=tokenized_words,
+                    speaker_mapping=speaker_mapping,
+                    speaker_probs=sortformer_for_alignment,
+                    ctc_num_frames=ctc.shape[0],
+                    ctc_step_seconds=ctc_step_seconds,
+                    blank_id=blank_id,
+                    retry_state=parallel_retry_state,
+                )
             )
             parallel_stream_tags = list(self._group_words_by_speaker(tokenized_words))
-            try:
-                rows, alignment_scores, final_coarse_diagnostics = self._align_parallel_word_streams_batched(
-                    tokenized_words=tokenized_words,
-                    ctc_log_probs=ctc,
-                    blank_id=blank_id,
-                    speaker_probs=sortformer_for_alignment,
-                    speaker_mapping=speaker_mapping,
-                    ctc_step_seconds=ctc_step_seconds,
-                    time_offset=time_offset,
-                    speaker_logprob_weight=float(speaker_weight),
-                    # The compact timeline excludes frames outside the padded
-                    # Sortformer-active regions. Do not hard-mask token emissions
-                    # again inside its collar: genuine onset/offset phones can fall
-                    # just below the activity threshold, while the soft prior and
-                    # t-SOT turn fences still constrain the path.
-                    speaker_gate_threshold=None,
-                    speaker_timelines=parallel_timelines,
-                    word_source_frame_bounds=parallel_turn_word_bounds or None,
-                )
-            except _NoValidCTCViterbiPathError as error:
-                if parallel_gate_threshold is None:
-                    raise
-                failed_speaker_tags: List[Optional[int]] = []
-                for failed_stream_index in error.failed_stream_indices:
-                    if not 0 <= failed_stream_index < len(parallel_stream_tags):
-                        raise RuntimeError("CTC Viterbi reported an invalid parallel stream index.") from error
-                    speaker_tag = parallel_stream_tags[failed_stream_index]
-                    diagnostic = parallel_active_region_diagnostics.get(speaker_tag, {})
-                    if bool(diagnostic.get('constrained_to_active_regions', False)):
-                        failed_speaker_tags.append(speaker_tag)
-                if not failed_speaker_tags:
-                    raise
-                for speaker_tag in failed_speaker_tags:
-                    parallel_timelines[speaker_tag] = self._full_ctc_timeline(ctc.shape[0])
-                    self._mark_full_timeline_fallback(
-                        parallel_active_region_diagnostics,
-                        speaker_tag,
-                        ctc.shape[0],
+            while parallel_timelines is not None:
+                try:
+                    rows, alignment_scores, final_coarse_diagnostics = self._align_parallel_word_streams_batched(
+                        tokenized_words=tokenized_words,
+                        ctc_log_probs=ctc,
+                        blank_id=blank_id,
+                        speaker_probs=sortformer_for_alignment,
+                        speaker_mapping=speaker_mapping,
+                        ctc_step_seconds=ctc_step_seconds,
+                        time_offset=time_offset,
+                        speaker_logprob_weight=float(speaker_weight),
+                        # The compact timeline excludes frames outside the padded
+                        # Sortformer-active regions. Do not hard-mask token emissions
+                        # again inside its collar: genuine onset/offset phones can fall
+                        # just below the activity threshold, while the soft prior and
+                        # t-SOT turn fences still constrain the path.
+                        speaker_gate_threshold=None,
+                        speaker_timelines=parallel_timelines,
+                        word_source_frame_bounds=parallel_turn_word_bounds or None,
                     )
-                rows, alignment_scores, final_coarse_diagnostics = self._align_parallel_word_streams_batched(
+                    terminal_failure = None
+                    break
+                except _NoValidCTCViterbiPathError as error:
+                    failed_speaker_tags: List[Optional[int]] = []
+                    for failed_stream_index in error.failed_stream_indices:
+                        if not 0 <= failed_stream_index < len(parallel_stream_tags):
+                            raise RuntimeError("CTC Viterbi reported an invalid parallel stream index.") from error
+                        failed_speaker_tags.append(parallel_stream_tags[failed_stream_index])
+                    if not failed_speaker_tags:
+                        raise
+                    exhausted = self._advance_parallel_gate_retry_state(
+                        parallel_retry_state,
+                        failed_speaker_tags,
+                    )
+                    if exhausted:
+                        terminal_failure = {
+                            'reason': 'no_valid_ctc_viterbi_path_in_active_regions',
+                            'failed_speaker_tags': failed_speaker_tags,
+                        }
+                        parallel_timelines = None
+                        break
+                    (
+                        parallel_timelines,
+                        parallel_active_region_diagnostics,
+                        terminal_failure,
+                    ) = self._build_parallel_active_timelines_with_retries(
+                        tokenized_words=tokenized_words,
+                        speaker_mapping=speaker_mapping,
+                        speaker_probs=sortformer_for_alignment,
+                        ctc_num_frames=ctc.shape[0],
+                        ctc_step_seconds=ctc_step_seconds,
+                        blank_id=blank_id,
+                        retry_state=parallel_retry_state,
+                    )
+
+            if parallel_timelines is None:
+                if terminal_failure is None:
+                    raise RuntimeError("Parallel active-region retry ended without an outcome.")
+                alignment_fallback = self._parallel_serialized_fallback_diagnostic(
+                    retry_state=parallel_retry_state,
+                    reason=str(terminal_failure['reason']),
+                    failed_speaker_tags=terminal_failure.get('failed_speaker_tags', []),
+                    capacity_failures=terminal_failure.get('capacity_failures'),
+                )
+                # The t-SOT transcript is authoritative. Do not reuse the
+                # speaker-wise tokenization or any Sortformer mapping from the
+                # failed parallel attempt: serialized CTC must see the original
+                # word order and no speaker prior.
+                mode = 'serialized'
+                tokenized_words = self._tokenize_words(
+                    parsed_sot_words,
+                    blank_id,
+                    alignment_mode='serialized',
+                )
+                speaker_mapping = {
+                    speaker_tag: None for speaker_tag in self._speaker_tags_in_order(tokenized_words)
+                }
+                assignment_scores = {}
+                rows, path_score, final_coarse_diagnostic = self._align_word_sequence(
                     tokenized_words=tokenized_words,
                     ctc_log_probs=ctc,
                     blank_id=blank_id,
-                    speaker_probs=sortformer_for_alignment,
+                    speaker_probs=None,
                     speaker_mapping=speaker_mapping,
                     ctc_step_seconds=ctc_step_seconds,
                     time_offset=time_offset,
-                    speaker_logprob_weight=float(speaker_weight),
+                    speaker_logprob_weight=0.0,
                     speaker_gate_threshold=None,
-                    speaker_timelines=parallel_timelines,
-                    word_source_frame_bounds=parallel_turn_word_bounds or None,
                 )
+                alignment_scores = {None: path_score}
+                final_coarse_diagnostics = {None: final_coarse_diagnostic}
 
         speaker_word_timestamps: Dict[Optional[int], List[Dict[str, Any]]] = {}
         for row in rows:
@@ -1954,7 +2034,9 @@ class PEETransformerCTCTimestampExtractor:
                 'speaker_assignment_scores': assignment_scores,
                 'speaker_count_policy': speaker_count_policy,
                 'parallel_speaker_gate_threshold': parallel_gate_threshold if mode == 'parallel' else None,
+                'parallel_speaker_gate_min_threshold': self.parallel_speaker_gate_min_threshold,
                 'parallel_active_regions': parallel_active_region_diagnostics if mode == 'parallel' else {},
+                'alignment_fallback': alignment_fallback,
                 'parallel_active_region_padding_seconds': self.parallel_active_region_padding_seconds,
                 'parallel_active_region_merge_gap_seconds': self.parallel_active_region_merge_gap_seconds,
                 'parallel_turn_fences': parallel_turn_diagnostics if mode == 'parallel' else {},
@@ -2131,7 +2213,11 @@ class PEETransformerCTCTimestampExtractor:
                     'ctc_log_normalizer_error': ctc_log_normalizer_error,
                     'requested_alignment_mode': requested_mode,
                     'alignment_mode': record_mode,
+                    'parsed_sot_words': parsed_sot_words,
                     'speaker_count_policy': speaker_count_policy,
+                    'alignment_fallback': None,
+                    'parallel_timelines': None,
+                    'parallel_gate_retry_state': None,
                     'candidate_sortformer_columns': candidate_sortformer_columns,
                     'tokenized_words': tokenized_words,
                     'serialized_turn_anchor_words': serialized_turn_anchor_words,
@@ -2313,52 +2399,44 @@ class PEETransformerCTCTimestampExtractor:
             record['speaker_mapping'] = speaker_mapping
             record['assignment_scores'] = assignment_scores
 
-        final_streams: List[Dict[str, Any]] = []
         parallel_active_region_diagnostics: Dict[int, Dict[Optional[int], Dict[str, Any]]] = {
             int(record['record_index']): {} for record in active_records
         }
         for record in active_records:
-            if record['alignment_mode'] == 'serialized':
-                num_frames = int(record['ctc'].shape[0])
-                final_streams.append(
-                    self._build_batched_record_stream(
-                        record=record,
-                        stream_key=None,
-                        tokenized_words=record['tokenized_words'],
-                        blank_id=blank_id,
-                        speaker_mapping=record['speaker_mapping'],
-                        source_frame_indices=torch.arange(num_frames, dtype=torch.long),
-                        active_region_ids=torch.zeros(num_frames, dtype=torch.long),
-                    )
-                )
+            if record['alignment_mode'] != 'parallel':
                 continue
-
-            timelines, diagnostics = self._build_parallel_active_timelines(
+            retry_state = self._new_parallel_gate_retry_state(
+                record['tokenized_words'],
+                parallel_gate_threshold,
+            )
+            record['parallel_gate_retry_state'] = retry_state
+            timelines, diagnostics, terminal_failure = self._build_parallel_active_timelines_with_retries(
                 tokenized_words=record['tokenized_words'],
                 speaker_mapping=record['speaker_mapping'],
                 speaker_probs=record['sortformer_on_ctc'],
                 ctc_num_frames=int(record['ctc'].shape[0]),
                 ctc_step_seconds=record['ctc_step_seconds'],
-                active_threshold=parallel_gate_threshold,
+                blank_id=blank_id,
+                retry_state=retry_state,
             )
             record_index = int(record['record_index'])
             parallel_active_region_diagnostics[record_index] = diagnostics
-            for stream_key, stream_words in self._group_words_by_speaker(record['tokenized_words']).items():
-                timeline = timelines[stream_key]
-                final_streams.append(
-                    self._build_batched_record_stream(
-                        record=record,
-                        stream_key=stream_key,
-                        tokenized_words=stream_words,
-                        blank_id=blank_id,
-                        speaker_mapping=record['speaker_mapping'],
-                        source_frame_indices=timeline['source_frame_indices'],
-                        active_region_ids=timeline['region_ids'],
-                        word_source_frame_bounds=record['parallel_turn_word_bounds'] or None,
-                    )
+            if terminal_failure is not None:
+                self._switch_batched_record_to_serialized_fallback(
+                    record=record,
+                    blank_id=blank_id,
+                    retry_state=retry_state,
+                    terminal_failure=terminal_failure,
                 )
+                continue
+            if timelines is None:
+                raise RuntimeError("Parallel active-region planning ended without a timeline or fallback.")
+            record['parallel_timelines'] = timelines
 
-        fallback_stream_indices: set[int] = set()
+        final_streams = self._build_final_batched_streams(
+            records=active_records,
+            blank_id=blank_id,
+        )
         while True:
             try:
                 final_alignment = self._align_record_streams_batched(
@@ -2367,53 +2445,83 @@ class PEETransformerCTCTimestampExtractor:
                     speaker_probs=global_speaker_probs,
                     blank_id=blank_id,
                     speaker_logprob_weight=float(speaker_weight),
-                    # The parallel timeline itself is the hard active-region selection.
+                    # The compact timeline itself is the hard active-region selection.
                     # Keep its padded collar available for CTC onset/offset tokens.
                     speaker_gate_threshold=None,
                     use_coarse_alignment=True,
                 )
                 break
             except _NoValidCTCViterbiPathError as error:
-                if parallel_gate_threshold is None:
-                    raise
-                newly_failed_indices: List[int] = []
+                failed_tags_by_record: Dict[int, List[Optional[int]]] = {}
+                failed_records: Dict[int, Dict[str, Any]] = {}
                 for failed_stream_index in error.failed_stream_indices:
                     if not 0 <= failed_stream_index < len(final_streams):
                         raise RuntimeError("CTC Viterbi reported an invalid batched parallel stream index.") from error
-                    if failed_stream_index in fallback_stream_indices:
-                        continue
                     stream = final_streams[failed_stream_index]
                     record = stream['record']
                     if record['alignment_mode'] != 'parallel':
-                        continue
+                        # Serialized CTC is the terminal fallback. If it has no
+                        # valid path, the transcript itself cannot be aligned and
+                        # there is no less-constrained mode left to try.
+                        raise
                     record_index = int(record['record_index'])
-                    diagnostic = parallel_active_region_diagnostics[record_index].get(stream['stream_key'], {})
-                    if bool(diagnostic.get('constrained_to_active_regions', False)):
-                        newly_failed_indices.append(failed_stream_index)
-                if not newly_failed_indices:
+                    failed_records[record_index] = record
+                    failed_tags_by_record.setdefault(record_index, []).append(stream['stream_key'])
+                if not failed_records:
                     raise
-                for failed_stream_index in newly_failed_indices:
-                    stream = final_streams[failed_stream_index]
-                    record = stream['record']
-                    record_index = int(record['record_index'])
-                    num_frames = int(record['ctc'].shape[0])
-                    full_timeline = self._full_ctc_timeline(num_frames)
-                    final_streams[failed_stream_index] = self._build_batched_record_stream(
-                        record=record,
-                        stream_key=stream['stream_key'],
-                        tokenized_words=stream['tokenized_words'],
-                        blank_id=blank_id,
+
+                for record_index, record in failed_records.items():
+                    retry_state = record.get('parallel_gate_retry_state')
+                    if not isinstance(retry_state, dict):
+                        raise RuntimeError("Parallel batch record is missing its adaptive gate retry state.")
+                    failed_speaker_tags = failed_tags_by_record[record_index]
+                    exhausted = self._advance_parallel_gate_retry_state(
+                        retry_state,
+                        failed_speaker_tags,
+                    )
+                    if exhausted:
+                        terminal_failure: Dict[str, Any] = {
+                            'reason': 'no_valid_ctc_viterbi_path_in_active_regions',
+                            'failed_speaker_tags': failed_speaker_tags,
+                        }
+                        self._switch_batched_record_to_serialized_fallback(
+                            record=record,
+                            blank_id=blank_id,
+                            retry_state=retry_state,
+                            terminal_failure=terminal_failure,
+                        )
+                        continue
+
+                    timelines, diagnostics, terminal_failure = self._build_parallel_active_timelines_with_retries(
+                        tokenized_words=record['tokenized_words'],
                         speaker_mapping=record['speaker_mapping'],
-                        source_frame_indices=full_timeline['source_frame_indices'],
-                        active_region_ids=full_timeline['region_ids'],
-                        word_source_frame_bounds=record['parallel_turn_word_bounds'] or None,
+                        speaker_probs=record['sortformer_on_ctc'],
+                        ctc_num_frames=int(record['ctc'].shape[0]),
+                        ctc_step_seconds=record['ctc_step_seconds'],
+                        blank_id=blank_id,
+                        retry_state=retry_state,
                     )
-                    self._mark_full_timeline_fallback(
-                        parallel_active_region_diagnostics[record_index],
-                        stream['stream_key'],
-                        num_frames,
-                    )
-                    fallback_stream_indices.add(failed_stream_index)
+                    parallel_active_region_diagnostics[record_index] = diagnostics
+                    if terminal_failure is not None:
+                        self._switch_batched_record_to_serialized_fallback(
+                            record=record,
+                            blank_id=blank_id,
+                            retry_state=retry_state,
+                            terminal_failure=terminal_failure,
+                        )
+                        continue
+                    if timelines is None:
+                        raise RuntimeError("Parallel active-region retry ended without a timeline or fallback.")
+                    record['parallel_timelines'] = timelines
+
+                # Repack the shared DP so healthy records remain batched while
+                # only the failing record(s) use their relaxed regions or one
+                # serialized t-SOT stream.
+                final_streams = self._build_final_batched_streams(
+                    records=active_records,
+                    blank_id=blank_id,
+                )
+
         final_rows: Dict[int, List[Dict[str, Any]]] = {
             int(record['record_index']): [] for record in active_records
         }
@@ -2464,6 +2572,51 @@ class PEETransformerCTCTimestampExtractor:
         if any(result is None for result in results):
             raise RuntimeError("Batch timestamp alignment did not produce one result per input record.")
         return [result for result in results if result is not None]
+
+    def _build_final_batched_streams(
+        self,
+        *,
+        records: Sequence[Dict[str, Any]],
+        blank_id: int,
+    ) -> List[Dict[str, Any]]:
+        """Build final serialized or compact-parallel streams after per-record planning."""
+        streams: List[Dict[str, Any]] = []
+        for record in records:
+            num_frames = int(record['ctc'].shape[0])
+            if record['alignment_mode'] == 'serialized':
+                streams.append(
+                    self._build_batched_record_stream(
+                        record=record,
+                        stream_key=None,
+                        tokenized_words=record['tokenized_words'],
+                        blank_id=blank_id,
+                        speaker_mapping=record['speaker_mapping'],
+                        source_frame_indices=torch.arange(num_frames, dtype=torch.long),
+                        active_region_ids=torch.zeros(num_frames, dtype=torch.long),
+                    )
+                )
+                continue
+
+            timelines = record.get('parallel_timelines')
+            if not isinstance(timelines, Mapping):
+                raise RuntimeError("A parallel batch record has no planned active-region timelines.")
+            for stream_key, stream_words in self._group_words_by_speaker(record['tokenized_words']).items():
+                timeline = timelines.get(stream_key)
+                if not isinstance(timeline, Mapping):
+                    raise RuntimeError(f"Missing parallel timeline for speaker tag {stream_key!r}.")
+                streams.append(
+                    self._build_batched_record_stream(
+                        record=record,
+                        stream_key=stream_key,
+                        tokenized_words=stream_words,
+                        blank_id=blank_id,
+                        speaker_mapping=record['speaker_mapping'],
+                        source_frame_indices=timeline['source_frame_indices'],
+                        active_region_ids=timeline['region_ids'],
+                        word_source_frame_bounds=record['parallel_turn_word_bounds'] or None,
+                    )
+                )
+        return streams
 
     def _build_batched_record_stream(
         self,
@@ -2652,9 +2805,11 @@ class PEETransformerCTCTimestampExtractor:
                 'speaker_assignment_scores': dict(assignment_scores),
                 'speaker_count_policy': dict(record.get('speaker_count_policy', {})),
                 'parallel_speaker_gate_threshold': parallel_gate_threshold if alignment_mode == 'parallel' else None,
+                'parallel_speaker_gate_min_threshold': self.parallel_speaker_gate_min_threshold,
                 'parallel_active_regions': (
                     dict(parallel_active_region_diagnostics) if alignment_mode == 'parallel' else {}
                 ),
+                'alignment_fallback': record.get('alignment_fallback'),
                 'parallel_active_region_padding_seconds': self.parallel_active_region_padding_seconds,
                 'parallel_active_region_merge_gap_seconds': self.parallel_active_region_merge_gap_seconds,
                 'parallel_turn_fences': (
@@ -3113,6 +3268,231 @@ class PEETransformerCTCTimestampExtractor:
         )
         return len(token_ids) + repeated_neighbours
 
+    def _parallel_gate_threshold_schedule(self, initial_threshold: Optional[float]) -> List[Optional[float]]:
+        """Return the bounded automatic threshold schedule for one speaker stream."""
+        if initial_threshold is None:
+            # ``None`` is an explicit request for the unrestricted timeline, so
+            # there is no active-region threshold to relax.
+            return [None]
+        initial = float(initial_threshold)
+        floor = min(initial, self.parallel_speaker_gate_min_threshold)
+        schedule: List[Optional[float]] = []
+        for candidate in (initial, 0.40, 0.30, 0.25, floor):
+            candidate = float(candidate)
+            if floor <= candidate <= initial and not any(
+                existing is not None and math.isclose(float(existing), candidate, abs_tol=1.0e-8)
+                for existing in schedule
+            ):
+                schedule.append(candidate)
+        return schedule
+
+    def _new_parallel_gate_retry_state(
+        self,
+        tokenized_words: Sequence[Dict[str, Any]],
+        initial_threshold: Optional[float],
+    ) -> Dict[str, Any]:
+        """Initialize independent adaptive threshold schedules for each t-SOT speaker."""
+        schedules = {
+            speaker_tag: self._parallel_gate_threshold_schedule(initial_threshold)
+            for speaker_tag in self._group_words_by_speaker(tokenized_words)
+        }
+        return {
+            'schedules': schedules,
+            'positions': {speaker_tag: 0 for speaker_tag in schedules},
+            'attempted_thresholds': {
+                speaker_tag: [schedule[0]] for speaker_tag, schedule in schedules.items()
+            },
+            'gate_floor': self.parallel_speaker_gate_min_threshold,
+        }
+
+    @staticmethod
+    def _parallel_gate_thresholds_for_retry_state(
+        retry_state: Mapping[str, Any],
+    ) -> Dict[Optional[int], Optional[float]]:
+        schedules = retry_state['schedules']
+        positions = retry_state['positions']
+        return {
+            speaker_tag: schedules[speaker_tag][positions[speaker_tag]]
+            for speaker_tag in schedules
+        }
+
+    @staticmethod
+    def _advance_parallel_gate_retry_state(
+        retry_state: Dict[str, Any],
+        speaker_tags: Sequence[Optional[int]],
+    ) -> List[Optional[int]]:
+        """Relax each requested stream once and return streams already at their floor."""
+        schedules = retry_state['schedules']
+        positions = retry_state['positions']
+        attempted_thresholds = retry_state['attempted_thresholds']
+        exhausted: List[Optional[int]] = []
+        for speaker_tag in dict.fromkeys(speaker_tags):
+            schedule = schedules.get(speaker_tag)
+            if not schedule:
+                exhausted.append(speaker_tag)
+                continue
+            position = int(positions[speaker_tag])
+            if position + 1 >= len(schedule):
+                exhausted.append(speaker_tag)
+                continue
+            position += 1
+            positions[speaker_tag] = position
+            attempted_thresholds[speaker_tag].append(schedule[position])
+        return exhausted
+
+    def _parallel_timeline_capacity_failures(
+        self,
+        *,
+        tokenized_words: Sequence[Dict[str, Any]],
+        blank_id: int,
+        timelines: Mapping[Optional[int], Mapping[str, torch.Tensor]],
+    ) -> Dict[Optional[int], Dict[str, int]]:
+        """Find target streams with fewer selected acoustic frames than CTC requires."""
+        failures: Dict[Optional[int], Dict[str, int]] = {}
+        for speaker_tag, speaker_words in self._group_words_by_speaker(tokenized_words).items():
+            timeline = timelines.get(speaker_tag)
+            if timeline is None:
+                raise RuntimeError(f"Missing active-region timeline for speaker tag {speaker_tag!r}.")
+            source_frame_indices = timeline.get('source_frame_indices')
+            if not isinstance(source_frame_indices, torch.Tensor):
+                raise TypeError("Parallel active-region timeline is missing source_frame_indices.")
+            _, _, flat_tokens = self._build_ctc_target(speaker_words, blank_id)
+            minimum_frames = self._minimum_ctc_frames(flat_tokens)
+            available_frames = int((source_frame_indices >= 0).sum().item())
+            if minimum_frames > available_frames:
+                failures[speaker_tag] = {
+                    'minimum_ctc_frames': minimum_frames,
+                    'available_ctc_frames': available_frames,
+                }
+        return failures
+
+    def _annotate_parallel_gate_retry_diagnostics(
+        self,
+        diagnostics: Dict[Optional[int], Dict[str, Any]],
+        retry_state: Mapping[str, Any],
+    ) -> None:
+        """Attach the per-speaker retry history to final active-region diagnostics."""
+        thresholds = self._parallel_gate_thresholds_for_retry_state(retry_state)
+        for speaker_tag, diagnostic in diagnostics.items():
+            diagnostic['adaptive_gate_retry'] = {
+                'attempted_thresholds': list(retry_state['attempted_thresholds'].get(speaker_tag, [])),
+                'selected_threshold': thresholds.get(speaker_tag),
+                'gate_floor': retry_state['gate_floor'],
+            }
+
+    def _build_parallel_active_timelines_with_retries(
+        self,
+        *,
+        tokenized_words: Sequence[Dict[str, Any]],
+        speaker_mapping: Dict[int, Optional[int]],
+        speaker_probs: Optional[torch.Tensor],
+        ctc_num_frames: int,
+        ctc_step_seconds: float,
+        blank_id: int,
+        retry_state: Dict[str, Any],
+    ) -> Tuple[
+        Optional[Dict[Optional[int], Dict[str, torch.Tensor]]],
+        Dict[Optional[int], Dict[str, Any]],
+        Optional[Dict[str, Any]],
+    ]:
+        """Plan compact timelines, relaxing only streams that cannot hold their CTC target."""
+        last_diagnostics: Dict[Optional[int], Dict[str, Any]] = {}
+        while True:
+            try:
+                timelines, diagnostics = self._build_parallel_active_timelines(
+                    tokenized_words=tokenized_words,
+                    speaker_mapping=speaker_mapping,
+                    speaker_probs=speaker_probs,
+                    ctc_num_frames=ctc_num_frames,
+                    ctc_step_seconds=ctc_step_seconds,
+                    active_threshold=self._parallel_gate_thresholds_for_retry_state(retry_state),
+                )
+            except _ParallelActiveRegionError as error:
+                exhausted = self._advance_parallel_gate_retry_state(retry_state, error.failed_speaker_tags)
+                if exhausted:
+                    return None, last_diagnostics, {
+                        'reason': error.reason,
+                        'failed_speaker_tags': list(error.failed_speaker_tags),
+                    }
+                continue
+
+            last_diagnostics = diagnostics
+            capacity_failures = self._parallel_timeline_capacity_failures(
+                tokenized_words=tokenized_words,
+                blank_id=blank_id,
+                timelines=timelines,
+            )
+            if capacity_failures:
+                failed_speaker_tags = list(capacity_failures)
+                exhausted = self._advance_parallel_gate_retry_state(retry_state, failed_speaker_tags)
+                if exhausted:
+                    return None, diagnostics, {
+                        'reason': 'insufficient_ctc_frames_in_active_regions',
+                        'failed_speaker_tags': failed_speaker_tags,
+                        'capacity_failures': capacity_failures,
+                    }
+                continue
+
+            self._annotate_parallel_gate_retry_diagnostics(diagnostics, retry_state)
+            return timelines, diagnostics, None
+
+    def _parallel_serialized_fallback_diagnostic(
+        self,
+        *,
+        retry_state: Mapping[str, Any],
+        reason: str,
+        failed_speaker_tags: Sequence[Optional[int]],
+        capacity_failures: Optional[Mapping[Optional[int], Mapping[str, int]]] = None,
+    ) -> Dict[str, Any]:
+        """Describe a terminal parallel failure without silently opening a full speaker timeline."""
+        diagnostic: Dict[str, Any] = {
+            'from_alignment_mode': 'parallel',
+            'to_alignment_mode': 'serialized',
+            'reason': reason,
+            'failed_speaker_tags': list(failed_speaker_tags),
+            'attempted_gate_thresholds': {
+                str(speaker_tag): list(thresholds)
+                for speaker_tag, thresholds in retry_state['attempted_thresholds'].items()
+            },
+            'gate_floor': retry_state['gate_floor'],
+        }
+        if capacity_failures:
+            diagnostic['capacity_failures'] = {
+                str(speaker_tag): dict(details) for speaker_tag, details in capacity_failures.items()
+            }
+        return diagnostic
+
+    def _switch_batched_record_to_serialized_fallback(
+        self,
+        *,
+        record: Dict[str, Any],
+        blank_id: int,
+        retry_state: Mapping[str, Any],
+        terminal_failure: Mapping[str, Any],
+    ) -> None:
+        """Make a single batch record use authoritative serialized t-SOT CTC."""
+        tokenized_words = self._tokenize_words(
+            record['parsed_sot_words'],
+            blank_id,
+            alignment_mode='serialized',
+        )
+        record['tokenized_words'] = tokenized_words
+        record['speaker_tags'] = self._speaker_tags_in_order(tokenized_words)
+        record['speaker_mapping'] = {
+            speaker_tag: None for speaker_tag in record['speaker_tags']
+        }
+        record['assignment_scores'] = {}
+        record['alignment_mode'] = 'serialized'
+        record['parallel_turn_word_bounds'] = {}
+        record['parallel_turn_diagnostics'] = {}
+        record['parallel_timelines'] = None
+        record['alignment_fallback'] = self._parallel_serialized_fallback_diagnostic(
+            retry_state=retry_state,
+            reason=str(terminal_failure['reason']),
+            failed_speaker_tags=terminal_failure.get('failed_speaker_tags', []),
+            capacity_failures=terminal_failure.get('capacity_failures'),
+        )
+
     def _build_parallel_active_timelines(
         self,
         *,
@@ -3121,7 +3501,7 @@ class PEETransformerCTCTimestampExtractor:
         speaker_probs: Optional[torch.Tensor],
         ctc_num_frames: int,
         ctc_step_seconds: float,
-        active_threshold: Optional[float],
+        active_threshold: Union[Optional[float], Mapping[Optional[int], Optional[float]]],
     ) -> Tuple[Dict[Optional[int], Dict[str, torch.Tensor]], Dict[Optional[int], Dict[str, Any]]]:
         """Build compact CTC timelines for independently aligned speaker streams.
 
@@ -3142,11 +3522,16 @@ class PEETransformerCTCTimestampExtractor:
 
         for speaker_tag in self._group_words_by_speaker(tokenized_words):
             column = speaker_mapping.get(speaker_tag)
+            speaker_threshold = (
+                active_threshold.get(speaker_tag)
+                if isinstance(active_threshold, Mapping)
+                else active_threshold
+            )
             constrained = (
                 speaker_tag is not None
                 and speaker_probs is not None
                 and column is not None
-                and active_threshold is not None
+                and speaker_threshold is not None
             )
             if not constrained:
                 timelines[speaker_tag] = {
@@ -3169,12 +3554,17 @@ class PEETransformerCTCTimestampExtractor:
                     f"Speaker tag {speaker_tag!r} maps to unavailable Sortformer column {column}."
                 )
             activity = speaker_probs[:, column]
-            active_frames = torch.nonzero(activity >= float(active_threshold), as_tuple=False).flatten().tolist()
+            active_frames = torch.nonzero(activity >= float(speaker_threshold), as_tuple=False).flatten().tolist()
             if not active_frames:
-                raise ValueError(
-                    "Parallel alignment found no Sortformer-active CTC frames for "
-                    f"speaker tag {speaker_tag!r} (column {column}, threshold {active_threshold}). "
-                    "Lower the threshold or use serialized alignment."
+                raise _ParallelActiveRegionError(
+                    [speaker_tag],
+                    reason='no_active_ctc_frames',
+                    details={
+                        speaker_tag: {
+                            'sortformer_column': column,
+                            'active_threshold': float(speaker_threshold),
+                        }
+                    },
                 )
 
             raw_regions: List[Tuple[int, int]] = []
@@ -3214,7 +3604,7 @@ class PEETransformerCTCTimestampExtractor:
             diagnostics[speaker_tag] = {
                 'constrained_to_active_regions': True,
                 'sortformer_column': column,
-                'active_threshold': float(active_threshold),
+                'active_threshold': float(speaker_threshold),
                 'padding_frames': padding_frames,
                 'merge_gap_frames': merge_gap_frames,
                 'raw_active_regions': [
@@ -3227,37 +3617,6 @@ class PEETransformerCTCTimestampExtractor:
                 'virtual_separator_count': max(0, len(merged_regions) - 1),
             }
         return timelines, diagnostics
-
-    @staticmethod
-    def _full_ctc_timeline(ctc_num_frames: int) -> Dict[str, torch.Tensor]:
-        """Return the uncompressed CTC timeline used for an active-region fallback."""
-        if ctc_num_frames <= 0:
-            raise ValueError("ctc_num_frames must be positive.")
-        return {
-            'source_frame_indices': torch.arange(ctc_num_frames, dtype=torch.long),
-            'region_ids': torch.zeros(ctc_num_frames, dtype=torch.long),
-        }
-
-    @staticmethod
-    def _mark_full_timeline_fallback(
-        diagnostics: Dict[Optional[int], Dict[str, Any]],
-        speaker_tag: Optional[int],
-        ctc_num_frames: int,
-    ) -> None:
-        """Record that one speaker stream had to leave its compact active regions."""
-        diagnostic = diagnostics.get(speaker_tag)
-        if diagnostic is None:
-            raise RuntimeError(f"Missing active-region diagnostics for speaker tag {speaker_tag!r}.")
-        diagnostics[speaker_tag] = {
-            **diagnostic,
-            'active_region_fallback': {
-                'mode': 'full_ctc_timeline',
-                'reason': 'no_valid_ctc_viterbi_path',
-                'initial_selected_ctc_frames': int(diagnostic.get('selected_ctc_frames', 0)),
-                'initial_virtual_separator_count': int(diagnostic.get('virtual_separator_count', 0)),
-                'fallback_selected_ctc_frames': int(ctc_num_frames),
-            },
-        }
 
     def _align_word_sequence(
         self,
