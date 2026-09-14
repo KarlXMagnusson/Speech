@@ -21,10 +21,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from lightning.pytorch.callbacks import Callback as PTLCallback
-from lightning.pytorch.callbacks import ModelCheckpoint
 from omegaconf import OmegaConf
 
+from nemo.core.classes.modelPT import ModelPT
 from nemo.lightning.base_callback import BaseCallback
+from nemo.lightning.callback_group import CallbackGroup, callback_context
 from nemo.lightning.one_logger_callback import (
     OneLoggerNeMoCallback,
     _get_base_callback_config,
@@ -32,6 +33,16 @@ from nemo.lightning.one_logger_callback import (
     get_nemo_v1_callback_config,
     get_one_logger_init_config,
 )
+from nemo.utils.callbacks.nemo_model_checkpoint import NeMoModelCheckpoint
+
+
+@pytest.fixture(autouse=True)
+def reset_one_logger_callback_singleton():
+    """Isolate singleton initialization assertions from import-time setup."""
+    previous_instance = OneLoggerNeMoCallback._instance
+    OneLoggerNeMoCallback._instance = None
+    yield
+    OneLoggerNeMoCallback._instance = previous_instance
 
 
 class TestOneLoggerNeMoCallback:
@@ -129,6 +140,12 @@ class TestOneLoggerCallback:
             assert config["world_size_or_fn"] == 1
 
     @pytest.mark.unit
+    def test_invalid_rank_environment_is_disabled_safely(self):
+        """Malformed scheduler metadata must not break application startup."""
+        with patch.dict(os.environ, {"RANK": "not-an-integer"}, clear=True):
+            assert _should_enable_for_current_rank() is False
+
+    @pytest.mark.unit
     def test_get_base_callback_config(self):
         """Test _get_base_callback_config with basic trainer setup."""
         trainer = MagicMock()
@@ -137,6 +154,7 @@ class TestOneLoggerCallback:
         trainer.val_check_interval = 1.0
         trainer.strategy = None
         trainer.log_every_n_steps = 10
+        trainer.datamodule = SimpleNamespace(cfg=OmegaConf.create({"validation_ds": {"batch_size": 2}}))
 
         with patch.dict(os.environ, {"SLURM_JOB_NAME": "test_job", "WORLD_SIZE": "4", "PERF_VERSION_TAG": "1.0.0"}):
             config = _get_base_callback_config(trainer=trainer, global_batch_size=32, seq_length=512)
@@ -159,8 +177,7 @@ class TestOneLoggerCallback:
         trainer.max_steps = 1000
         trainer.val_check_interval = 0
 
-        # Real ModelCheckpoint callback to satisfy isinstance checks
-        checkpoint_callback = ModelCheckpoint(dirpath=".", save_top_k=-1)
+        checkpoint_callback = NeMoModelCheckpoint(dirpath=".", save_top_k=-1)
         trainer.callbacks = [checkpoint_callback]
 
         with patch.dict(os.environ, {"SLURM_JOB_NAME": "test_job", "WORLD_SIZE": "2"}):
@@ -217,7 +234,7 @@ class TestOneLoggerCallback:
             config = get_nemo_v1_callback_config(trainer)
 
             assert config["global_batch_size_or_fn"] == 16  # 8 * 2
-            assert config["seq_length_or_fn"] == 768
+            assert config["seq_length_or_fn"] is None
             assert config["train_iterations_target_or_fn"] == 500
 
     @pytest.mark.unit
@@ -237,7 +254,7 @@ class TestOneLoggerCallback:
 
             # Average bucket batch size is (4+8+12)/3 = 8
             assert config["global_batch_size_or_fn"] == 8
-            assert config["seq_length_or_fn"] == 512
+            assert config["seq_length_or_fn"] is None
 
     @pytest.mark.unit
     def test_get_nemo_v1_callback_config_fallback(self):
@@ -254,7 +271,7 @@ class TestOneLoggerCallback:
         config = get_nemo_v1_callback_config(trainer)
 
         assert config["global_batch_size_or_fn"] == 1  # fallback
-        assert config["seq_length_or_fn"] == 1  # fallback
+        assert config["seq_length_or_fn"] is None
         assert config["train_iterations_target_or_fn"] == 100
 
     @pytest.mark.unit
@@ -263,6 +280,31 @@ class TestOneLoggerCallback:
         with patch.dict(os.environ, {}, clear=True):
             result = _should_enable_for_current_rank()
             assert result is False
+
+    @pytest.mark.unit
+    def test_should_enable_for_current_rank_slurm_rank0(self):
+        """Native Slurm launches expose SLURM_PROCID instead of RANK."""
+        with patch.dict(os.environ, {"SLURM_PROCID": "0", "SLURM_NTASKS": "4"}, clear=True):
+            assert _should_enable_for_current_rank() is True
+
+    @pytest.mark.unit
+    def test_should_disable_for_nonzero_slurm_rank(self):
+        """Only one native Slurm rank should emit telemetry."""
+        with patch.dict(os.environ, {"SLURM_PROCID": "1", "SLURM_NTASKS": "4"}, clear=True):
+            assert _should_enable_for_current_rank() is False
+
+    @pytest.mark.unit
+    def test_should_enable_for_lightning_local_rank0(self):
+        """Lightning subprocess launch metadata should enable only global rank zero."""
+        env = {"LOCAL_RANK": "0", "LOCAL_WORLD_SIZE": "8", "NODE_RANK": "0", "WORLD_SIZE": "16"}
+        with patch.dict(os.environ, env, clear=True):
+            assert _should_enable_for_current_rank() is True
+
+    @pytest.mark.unit
+    def test_should_disable_for_lightning_rank_on_second_node(self):
+        env = {"LOCAL_RANK": "0", "LOCAL_WORLD_SIZE": "8", "NODE_RANK": "1", "WORLD_SIZE": "16"}
+        with patch.dict(os.environ, env, clear=True):
+            assert _should_enable_for_current_rank() is False
 
     @pytest.mark.unit
     def test_should_enable_for_current_rank_distributed_rank0(self):
@@ -277,6 +319,154 @@ class TestOneLoggerCallback:
         with patch.dict(os.environ, {"RANK": "1", "WORLD_SIZE": "4"}):
             result = _should_enable_for_current_rank()
             assert result is False
+
+    @pytest.mark.unit
+    def test_validation_disabled_without_validation_data(self):
+        trainer = MagicMock()
+        trainer.max_steps = 10
+        trainer.callbacks = []
+        trainer.val_check_interval = 1.0
+        trainer.strategy = None
+        trainer.log_every_n_steps = 10
+        trainer.datamodule = SimpleNamespace(cfg=OmegaConf.create({"train_ds": {"batch_size": 2}}))
+
+        config = _get_base_callback_config(trainer=trainer, global_batch_size=2, seq_length=None)
+
+        assert config["is_validation_iterations_enabled_or_fn"] is False
+
+    @pytest.mark.unit
+    def test_validation_enabled_from_datamodule_config(self):
+        trainer = MagicMock()
+        trainer.max_steps = 10
+        trainer.callbacks = []
+        trainer.val_check_interval = 1.0
+        trainer.strategy = None
+        trainer.log_every_n_steps = 10
+        trainer.datamodule = SimpleNamespace(
+            cfg=OmegaConf.create({"train_ds": {"batch_size": 2}, "validation_ds": {"batch_size": 2}})
+        )
+
+        config = _get_base_callback_config(trainer=trainer, global_batch_size=2, seq_length=None)
+
+        assert config["is_validation_iterations_enabled_or_fn"] is True
+
+    @pytest.mark.unit
+    def test_hidden_size_is_not_reported_as_sequence_length(self):
+        trainer = MagicMock()
+        trainer.max_steps = 10
+        trainer.callbacks = []
+        trainer.val_check_interval = 0
+        trainer.strategy = None
+        trainer.log_every_n_steps = 10
+        trainer.lightning_module = SimpleNamespace(
+            cfg=OmegaConf.create({"train_ds": {"batch_size": 2}, "encoder": {"d_model": 512}})
+        )
+
+        config = get_nemo_v1_callback_config(trainer)
+
+        assert config["seq_length_or_fn"] is None
+
+    @pytest.mark.unit
+    def test_callback_group_attaches_callback_once(self):
+        group = CallbackGroup.__new__(CallbackGroup)
+        callback = BaseCallback()
+        group._callbacks = [callback]
+        trainer = SimpleNamespace(callbacks=[])
+
+        group.attach_to_trainer(trainer)
+        group.attach_to_trainer(trainer)
+
+        assert trainer.callbacks == [callback]
+
+    @pytest.mark.unit
+    def test_disabled_callback_is_not_attached(self):
+        group = CallbackGroup.__new__(CallbackGroup)
+        callback = BaseCallback()
+        callback.enabled_for_current_rank = False
+        group._callbacks = [callback]
+        trainer = SimpleNamespace(callbacks=[])
+
+        group.attach_to_trainer(trainer)
+
+        assert trainer.callbacks == []
+
+    @pytest.mark.unit
+    def test_modelpt_subclass_init_emits_one_paired_span(self):
+        class ParentModel(ModelPT):
+            def __init__(self):
+                pass
+
+            @classmethod
+            def list_available_models(cls):
+                return []
+
+            def setup_training_data(self, train_data_config):
+                pass
+
+            def setup_validation_data(self, val_data_config):
+                pass
+
+        class ChildModel(ParentModel):
+            def __init__(self):
+                super().__init__()
+
+        group = MagicMock()
+        with patch('nemo.lightning.callback_group.CallbackGroup.get_instance', return_value=group):
+            ChildModel()
+
+        group.on_model_init_start.assert_called_once_with()
+        group.on_model_init_end.assert_called_once_with()
+
+    @pytest.mark.unit
+    def test_callback_context_always_emits_end(self):
+        group = MagicMock()
+        with patch('nemo.lightning.callback_group.CallbackGroup.get_instance', return_value=group):
+            with pytest.raises(RuntimeError, match="boom"):
+                with callback_context('on_model_init_start', 'on_model_init_end'):
+                    raise RuntimeError("boom")
+
+        group.on_model_init_start.assert_called_once_with()
+        group.on_model_init_end.assert_called_once_with()
+
+    @pytest.mark.unit
+    @patch('nemo.utils.callbacks.nemo_model_checkpoint.CallbackGroup.get_instance')
+    def test_checkpoint_lifecycle_success(self, mock_get_group, tmp_path):
+        group = mock_get_group.return_value
+        callback = NeMoModelCheckpoint(dirpath=tmp_path, save_top_k=-1)
+        callback.set_checkpoint_unfinished_marker = MagicMock()
+        callback.remove_checkpoint_unfinished_marker = MagicMock()
+        trainer = SimpleNamespace(
+            global_step=7,
+            callbacks=[],
+            is_global_zero=False,
+            loggers=[],
+            save_checkpoint=MagicMock(),
+        )
+
+        callback._save_checkpoint(trainer, str(tmp_path / "model.ckpt"))
+
+        group.on_save_checkpoint_start.assert_called_once_with(7)
+        group.on_save_checkpoint_success.assert_called_once_with(7)
+        group.on_save_checkpoint_end.assert_called_once_with()
+
+    @pytest.mark.unit
+    @patch('nemo.utils.callbacks.nemo_model_checkpoint.CallbackGroup.get_instance')
+    def test_checkpoint_lifecycle_ends_on_failure(self, mock_get_group, tmp_path):
+        group = mock_get_group.return_value
+        callback = NeMoModelCheckpoint(dirpath=tmp_path, save_top_k=-1)
+        callback.set_checkpoint_unfinished_marker = MagicMock()
+        trainer = SimpleNamespace(
+            global_step=9,
+            callbacks=[],
+            save_checkpoint=MagicMock(side_effect=RuntimeError("save failed")),
+        )
+
+        with pytest.raises(RuntimeError, match="save failed"):
+            callback._save_checkpoint(trainer, str(tmp_path / "model.ckpt"))
+
+        group.on_save_checkpoint_start.assert_called_once_with(9)
+        group.on_save_checkpoint_success.assert_not_called()
+        group.on_save_checkpoint_end.assert_called_once_with()
 
     @patch('nemo.lightning.one_logger_callback.TrainingTelemetryProvider')
     @patch('nemo.lightning.one_logger_callback.get_nemo_v1_callback_config')
