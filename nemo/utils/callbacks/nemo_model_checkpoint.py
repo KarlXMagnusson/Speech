@@ -551,8 +551,8 @@ class NeMoModelCheckpoint(ModelCheckpoint):
             group.on_save_checkpoint_end()
 
     def _save_checkpoint_with_lifecycle(
-        self, trainer: 'lightning.pytorch.Trainer', filepath: str
-    ) -> None:  # noqa: F821
+        self, trainer: 'lightning.pytorch.Trainer', filepath: str  # noqa: F821
+    ) -> None:
         # barrier_after=True, so all ranks continue after the unfinished checkpoint marker is placed.
         # if anything goes wrong during checkpointing, we should be able to detect that data is incomplete.
         self.set_checkpoint_unfinished_marker(filepath, barrier_after=True)
