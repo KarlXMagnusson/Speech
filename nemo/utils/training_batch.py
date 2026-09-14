@@ -87,6 +87,7 @@ def get_data_parallel_group(pl_module: LightningModule):
             if parallel_state.model_parallel_is_initialized():
                 return parallel_state.get_data_parallel_group(with_context_parallel=False)
         except (AttributeError, ImportError, RuntimeError, TypeError):
+            # Megatron Core is optional or may not have initialized its groups yet.
             pass
         return None
 
@@ -99,11 +100,13 @@ def get_data_parallel_group(pl_module: LightningModule):
 
         return get_flat_mesh(device_mesh, "dp").get_group()
     except (ImportError, KeyError, RuntimeError, ValueError):
+        # Automodel is optional; fall through to other DeviceMesh conventions.
         pass
 
     try:
         return device_mesh["dp"].get_group()
     except (KeyError, RuntimeError, ValueError):
+        # The mesh may use explicit replicate/shard dimension names below.
         pass
 
     if "dp_shard" in names and "dp_replicate" in names:
