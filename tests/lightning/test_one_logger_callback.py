@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 from lightning.pytorch.callbacks import Callback as PTLCallback
 from omegaconf import OmegaConf
 
@@ -125,7 +126,7 @@ class TestOneLoggerCallback:
             config = get_one_logger_init_config()
 
             assert isinstance(config, dict)
-            assert config["application_name"] == "nemo"
+            assert config["application_name"] == "nemo-speech"
             assert config["session_tag_or_fn"] == "test_job"
             assert "enable_for_current_rank" in config
             assert config["world_size_or_fn"] == 4
@@ -154,6 +155,7 @@ class TestOneLoggerCallback:
         trainer.val_check_interval = 1.0
         trainer.strategy = None
         trainer.log_every_n_steps = 10
+        trainer.accumulate_grad_batches = 1
         trainer.datamodule = SimpleNamespace(cfg=OmegaConf.create({"validation_ds": {"batch_size": 2}}))
 
         with patch.dict(os.environ, {"SLURM_JOB_NAME": "test_job", "WORLD_SIZE": "4", "PERF_VERSION_TAG": "1.0.0"}):
@@ -220,59 +222,64 @@ class TestOneLoggerCallback:
 
     @pytest.mark.unit
     def test_get_nemo_v1_callback_config(self):
-        """Test get_nemo_v1_callback_config with model configuration."""
-        trainer = MagicMock()
-        trainer.max_steps = 500
-        trainer.val_check_interval = 0  # Set to 0 to avoid validation
+        """Runtime batch callables are used instead of train_ds batch-size hints."""
+        trainer = MagicMock(max_steps=500, callbacks=[], strategy=None, log_every_n_steps=10)
+        trainer.lightning_module.cfg = OmegaConf.create({"train_ds": {"batch_size": 8}})
+        current = {"global": 7, "local": 3}
 
-        # Mock lightning module with config
-        pl_module = MagicMock()
-        pl_module.cfg = OmegaConf.create({"train_ds": {"batch_size": 8}, "encoder": {"d_model": 768}})
-        trainer.lightning_module = pl_module
+        with patch.dict(os.environ, {"WORLD_SIZE": "2"}, clear=True):
+            config = get_nemo_v1_callback_config(
+                trainer,
+                global_batch_size=lambda: current["global"],
+                micro_batch_size=lambda: current["local"],
+            )
 
-        with patch.dict(os.environ, {"WORLD_SIZE": "2"}):
-            config = get_nemo_v1_callback_config(trainer)
-
-            assert config["global_batch_size_or_fn"] == 16  # 8 * 2
-            assert config["seq_length_or_fn"] is None
-            assert config["train_iterations_target_or_fn"] == 500
+        assert config["global_batch_size_or_fn"]() == 7
+        assert config["micro_batch_size_or_fn"]() == 3
+        assert config["seq_length_or_fn"] is None
+        assert config["train_samples_target_or_fn"] is None
+        assert "_bf" not in config["perf_tag_or_fn"]
 
     @pytest.mark.unit
     def test_get_nemo_v1_callback_config_bucket_batch_size(self):
-        """Test get_nemo_v1_callback_config with bucket batch sizes (ASR case)."""
-        trainer = MagicMock()
-        trainer.max_steps = 1000
-        trainer.val_check_interval = 0  # Set to 0 to avoid validation
+        """Per-bucket limits must never be averaged into a reported batch size."""
+        trainer = MagicMock(max_steps=1000, callbacks=[], strategy=None, log_every_n_steps=10)
+        trainer.lightning_module.cfg = OmegaConf.create(
+            {"train_ds": {"bucket_batch_size": [4, 8, 12], "bucket_duration_bins": [5, 10, 20]}}
+        )
 
-        # Mock lightning module with bucket batch sizes
-        pl_module = MagicMock()
-        pl_module.cfg = OmegaConf.create({"train_ds": {"bucket_batch_size": [4, 8, 12]}, "encoder": {"d_model": 512}})
-        trainer.lightning_module = pl_module
+        config = get_nemo_v1_callback_config(trainer, global_batch_size=lambda: 4, micro_batch_size=lambda: 4)
 
-        with patch.dict(os.environ, {"WORLD_SIZE": "1"}):
-            config = get_nemo_v1_callback_config(trainer)
-
-            # Average bucket batch size is (4+8+12)/3 = 8
-            assert config["global_batch_size_or_fn"] == 8
-            assert config["seq_length_or_fn"] is None
+        assert callable(config["global_batch_size_or_fn"])
+        assert config["global_batch_size_or_fn"]() == 4
+        assert config["train_samples_target_or_fn"] is None
 
     @pytest.mark.unit
     def test_get_nemo_v1_callback_config_fallback(self):
-        """Test get_nemo_v1_callback_config with fallback values."""
-        trainer = MagicMock()
-        trainer.max_steps = 100
-        trainer.val_check_interval = 0  # Set to 0 to avoid validation
+        """An unknown batch size is rejected instead of silently reporting one."""
+        trainer = MagicMock(max_steps=100, callbacks=[], strategy=None, log_every_n_steps=10)
 
-        # Mock lightning module without required config
-        pl_module = MagicMock()
-        pl_module.cfg = OmegaConf.create({})
-        trainer.lightning_module = pl_module
+        with pytest.raises(ValueError, match="must be measured at runtime"):
+            get_nemo_v1_callback_config(trainer)
 
-        config = get_nemo_v1_callback_config(trainer)
+    @pytest.mark.unit
+    def test_explicit_fixed_batch_overrides_remain_supported(self):
+        trainer = MagicMock(max_steps=100, callbacks=[], strategy=None, log_every_n_steps=10)
+        trainer.accumulate_grad_batches = 1
+        env = {
+            "WORLD_SIZE": "4",
+            "NEMO_ONE_LOGGER_GLOBAL_BATCH_SIZE": "16",
+            "NEMO_ONE_LOGGER_MICRO_BATCH_SIZE": "4",
+            "NEMO_ONE_LOGGER_SEQUENCE_LENGTH": "256",
+        }
 
-        assert config["global_batch_size_or_fn"] == 1  # fallback
-        assert config["seq_length_or_fn"] is None
-        assert config["train_iterations_target_or_fn"] == 100
+        with patch.dict(os.environ, env, clear=True):
+            config = get_nemo_v1_callback_config(trainer)
+
+        assert config["global_batch_size_or_fn"] == 16
+        assert config["micro_batch_size_or_fn"] == 4
+        assert config["seq_length_or_fn"] == 256
+        assert config["train_samples_target_or_fn"] == 1600
 
     @pytest.mark.unit
     def test_should_enable_for_current_rank_single_process(self):
@@ -351,20 +358,18 @@ class TestOneLoggerCallback:
         assert config["is_validation_iterations_enabled_or_fn"] is True
 
     @pytest.mark.unit
-    def test_hidden_size_is_not_reported_as_sequence_length(self):
-        trainer = MagicMock()
-        trainer.max_steps = 10
-        trainer.callbacks = []
-        trainer.val_check_interval = 0
-        trainer.strategy = None
-        trainer.log_every_n_steps = 10
-        trainer.lightning_module = SimpleNamespace(
-            cfg=OmegaConf.create({"train_ds": {"batch_size": 2}, "encoder": {"d_model": 512}})
+    def test_sequence_length_is_only_reported_when_explicit(self):
+        trainer = MagicMock(max_steps=10, callbacks=[], strategy=None, log_every_n_steps=10)
+        trainer.lightning_module.cfg = OmegaConf.create(
+            {"train_ds": {"max_seq_length": 512, "batch_tokens": 4000}, "encoder": {"d_model": 512}}
         )
 
-        config = get_nemo_v1_callback_config(trainer)
-
+        config = get_nemo_v1_callback_config(trainer, global_batch_size=lambda: 2)
         assert config["seq_length_or_fn"] is None
+
+        with patch.dict(os.environ, {"NEMO_ONE_LOGGER_SEQUENCE_LENGTH": "256"}, clear=True):
+            config = get_nemo_v1_callback_config(trainer, global_batch_size=lambda: 2)
+        assert config["seq_length_or_fn"] == 256
 
     @pytest.mark.unit
     def test_callback_group_attaches_callback_once(self):
@@ -389,6 +394,19 @@ class TestOneLoggerCallback:
         group.attach_to_trainer(trainer)
 
         assert trainer.callbacks == []
+
+    @pytest.mark.unit
+    def test_disabled_collective_participant_is_attached(self):
+        group = CallbackGroup.__new__(CallbackGroup)
+        callback = BaseCallback()
+        callback.enabled_for_current_rank = False
+        callback.participates_on_all_ranks = True
+        group._callbacks = [callback]
+        trainer = SimpleNamespace(callbacks=[])
+
+        group.attach_to_trainer(trainer)
+
+        assert trainer.callbacks == [callback]
 
     @pytest.mark.unit
     def test_modelpt_subclass_init_emits_one_paired_span(self):
@@ -486,95 +504,62 @@ class TestOneLoggerCallback:
         group.on_save_checkpoint_success.assert_not_called()
         group.on_save_checkpoint_end.assert_called_once_with()
 
+    @patch('nemo.lightning.one_logger_callback.on_training_single_iteration_end')
+    @patch('nemo.lightning.one_logger_callback.on_training_single_iteration_start')
+    @patch('nemo.lightning.one_logger_callback.on_train_start')
     @patch('nemo.lightning.one_logger_callback.TrainingTelemetryProvider')
-    @patch('nemo.lightning.one_logger_callback.get_nemo_v1_callback_config')
     @patch('nemo.lightning.one_logger_callback.TrainingTelemetryConfig')
     @patch('nemo.lightning.one_logger_callback.get_one_logger_init_config')
     @patch('nemo.lightning.one_logger_callback.OneLoggerConfig')
     @patch('nemo.lightning.one_logger_callback.on_app_start')
-    @patch('nemo.lightning.one_logger_callback.OneLoggerPTLCallback')
-    def test_update_config_v1(
+    @patch('nemo.lightning.one_logger_callback.OneLoggerPTLCallback.__init__', return_value=None)
+    def test_dynamic_batches_are_measured_and_accumulated(
         self,
-        mock_ptl_callback,
-        mock_on_app_start,
+        mock_ptl_init,
+        mock_app_start,
         mock_config_class,
-        mock_get_config,
-        mock_telemetry_config_class,
-        mock_get_v1_config,
+        mock_get_init_config,
+        mock_training_config_class,
         mock_provider,
+        mock_train_start,
+        mock_iteration_start,
+        mock_iteration_end,
     ):
-        """Test update_config with nemo_version='v1'."""
-        # Setup mocks
-        mock_get_config.return_value = {"application_name": "test"}
-        mock_config_class.return_value = MagicMock()
-        mock_provider_instance = MagicMock()
-        mock_provider_instance.config = MagicMock()
-        mock_provider_instance.config.telemetry_config = None
-        mock_provider.instance.return_value = mock_provider_instance
-        mock_ptl_callback.return_value = MagicMock()
-
-        mock_v1_config = {"job_name": "test-job", "world_size": 1, "global_batch_size": 32, "seq_length": 1024}
-        mock_get_v1_config.return_value = mock_v1_config
-
-        mock_telemetry_config_instance = MagicMock()
-        mock_telemetry_config_class.return_value = mock_telemetry_config_instance
-
-        # Create callback and trainer
+        mock_get_init_config.return_value = {"application_name": "nemo-speech", "enable_for_current_rank": True}
+        provider = MagicMock()
+        provider.config.telemetry_config = None
+        mock_provider.instance.return_value = provider
         callback = OneLoggerNeMoCallback()
-        trainer = MagicMock()
+        trainer = SimpleNamespace(global_step=4, max_steps=20, callbacks=[], strategy=None, log_every_n_steps=5)
+        module = SimpleNamespace(device=torch.device("cpu"))
 
-        # Call update_config
-        callback.update_config(nemo_version='v1', trainer=trainer)
+        callback.update_config(nemo_version="lightning", trainer=trainer)
+        assert provider.set_training_telemetry_config.call_count == 0
+        callback.load_state_dict({"num_samples_total": 9})
+        callback.on_train_start(trainer, module)
 
-        # Verify v1 config was called
-        mock_get_v1_config.assert_called_once_with(trainer=trainer)
-        mock_telemetry_config_class.assert_called_once_with(**mock_v1_config)
-        mock_provider_instance.set_training_telemetry_config.assert_called_once_with(mock_telemetry_config_instance)
+        first_batch = {"input_signal": torch.zeros(2, 20), "input_signal_length": torch.tensor([20, 15])}
+        callback.on_train_batch_start(trainer, module, first_batch, 0)
+        callback.on_train_batch_end(trainer, module, None, first_batch, 0)
+        configured = mock_training_config_class.call_args.kwargs
+        assert configured["global_batch_size_or_fn"]() == 2
+        assert configured["micro_batch_size_or_fn"]() == 2
+        assert configured["seq_length_or_fn"] is None
+        assert configured["train_samples_target_or_fn"] is None
 
-    @patch('nemo.lightning.one_logger_callback.TrainingTelemetryProvider')
-    @patch('nemo.lightning.one_logger_callback.get_nemo_v1_callback_config')
-    @patch('nemo.lightning.one_logger_callback.TrainingTelemetryConfig')
-    @patch('nemo.lightning.one_logger_callback.get_one_logger_init_config')
-    @patch('nemo.lightning.one_logger_callback.OneLoggerConfig')
-    @patch('nemo.lightning.one_logger_callback.on_app_start')
-    @patch('nemo.lightning.one_logger_callback.OneLoggerPTLCallback')
-    def test_update_config_unknown_version_defaults_to_v1(
-        self,
-        mock_ptl_callback,
-        mock_on_app_start,
-        mock_config_class,
-        mock_get_config,
-        mock_telemetry_config_class,
-        mock_get_v1_config,
-        mock_provider,
-    ):
-        """Test update_config with unknown version defaults to v1."""
-        # Setup mocks
-        mock_get_config.return_value = {"application_name": "test"}
-        mock_config_class.return_value = MagicMock()
-        mock_provider_instance = MagicMock()
-        mock_provider_instance.config = MagicMock()
-        mock_provider_instance.config.telemetry_config = None
-        mock_provider.instance.return_value = mock_provider_instance
-        mock_ptl_callback.return_value = MagicMock()
+        second_batch = {"input_signal": torch.zeros(3, 20), "input_signal_length": torch.tensor([20, 15, 10])}
+        callback.on_train_batch_start(trainer, module, second_batch, 1)
+        callback.on_train_batch_end(trainer, module, None, second_batch, 1)
 
-        mock_v1_config = {"job_name": "test-job"}
-        mock_get_v1_config.return_value = mock_v1_config
-
-        mock_telemetry_config_instance = MagicMock()
-        mock_telemetry_config_class.return_value = mock_telemetry_config_instance
-
-        # Create callback and trainer
-        callback = OneLoggerNeMoCallback()
-        trainer = MagicMock()
-
-        # Call update_config with unknown version
-        callback.update_config(nemo_version='unknown', trainer=trainer)
-
-        # Verify v1 config was called (default fallback)
-        mock_get_v1_config.assert_called_once_with(trainer=trainer)
-        mock_telemetry_config_class.assert_called_once_with(**mock_v1_config)
-        mock_provider_instance.set_training_telemetry_config.assert_called_once_with(mock_telemetry_config_instance)
+        assert configured["global_batch_size_or_fn"]() == 3
+        assert callback.num_samples_total == 14
+        mock_train_start.assert_called_once_with(
+            train_iterations_start=4,
+            train_samples_start=9,
+            start_time_msec=callback._train_start_time_msec,
+        )
+        assert mock_iteration_start.call_count == 2
+        assert mock_iteration_end.call_count == 2
 
     def test_export_all_symbols(self):
         """Test that __all__ contains the expected symbols."""
@@ -616,50 +601,6 @@ class TestOneLoggerCallback:
         call_args = mock_config_class.call_args[1]
         assert call_args['session_tag_or_fn'] == 'test-experiment'
         assert call_args['world_size_or_fn'] == 4
-
-    @patch('nemo.lightning.one_logger_callback.TrainingTelemetryProvider')
-    @patch('nemo.lightning.one_logger_callback.get_nemo_v1_callback_config')
-    @patch('nemo.lightning.one_logger_callback.TrainingTelemetryConfig')
-    @patch('nemo.lightning.one_logger_callback.get_one_logger_init_config')
-    @patch('nemo.lightning.one_logger_callback.OneLoggerConfig')
-    @patch('nemo.lightning.one_logger_callback.on_app_start')
-    @patch('nemo.lightning.one_logger_callback.OneLoggerPTLCallback')
-    def test_update_config_with_empty_config(
-        self,
-        mock_ptl_callback,
-        mock_on_app_start,
-        mock_config_class,
-        mock_get_config,
-        mock_telemetry_config_class,
-        mock_get_v1_config,
-        mock_provider,
-    ):
-        """Test update_config with empty configuration dictionary."""
-        # Setup mocks
-        mock_get_config.return_value = {"application_name": "test"}
-        mock_config_class.return_value = MagicMock()
-        mock_provider_instance = MagicMock()
-        mock_provider_instance.config = MagicMock()
-        mock_provider_instance.config.telemetry_config = None
-        mock_provider.instance.return_value = mock_provider_instance
-        mock_ptl_callback.return_value = MagicMock()
-
-        # Return empty config
-        mock_get_v1_config.return_value = {}
-
-        mock_telemetry_config_instance = MagicMock()
-        mock_telemetry_config_class.return_value = mock_telemetry_config_instance
-
-        # Create callback and trainer
-        callback = OneLoggerNeMoCallback()
-        trainer = MagicMock()
-
-        # Call update_config
-        callback.update_config(nemo_version='v1', trainer=trainer)
-
-        # Verify empty config was passed to TrainingTelemetryConfig
-        mock_telemetry_config_class.assert_called_once_with(**{})
-        mock_provider_instance.set_training_telemetry_config.assert_called_once_with(mock_telemetry_config_instance)
 
     def test_callback_instantiation_without_mocks_raises_import_error(self):
         """Test that callback instantiation without proper mocks raises appropriate errors."""
