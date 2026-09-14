@@ -162,7 +162,10 @@ def parse_args() -> argparse.Namespace:
         "--alignment-mode",
         choices=("parallel", "serialized"),
         default="serialized",
-        help="Follow the t-SOT word order on one CTC path (default: serialized).",
+        help=(
+            "Follow the t-SOT word order on one CTC path (default: serialized). In parallel mode, "
+            "t-SOT speaker tags remain authoritative: too few active Sortformer streams automatically use serialized CTC."
+        ),
     )
     parser.add_argument(
         "--speaker-assignment-mode",
@@ -239,8 +242,8 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "Optional directory for per-record json/, ctm/, and seglst/ files. "
-            "Required to write CTM or SegLST for multiple manifest records."
+            "Optional directory for per-record json/, ctm/, seglst/, and rttm/ files. "
+            "Required to write CTM, SegLST, or RTTM for multiple manifest records."
         ),
     )
     parser.add_argument(
@@ -259,6 +262,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional merged speaker-segment JSON (.seglst) path.",
     )
     parser.add_argument(
+        "--output-rttm",
+        type=Path,
+        default=None,
+        help="Optional merged speaker-segment RTTM path.",
+    )
+    parser.add_argument(
         "--merge-threshold",
         type=float,
         default=0.1,
@@ -272,7 +281,7 @@ def parse_args() -> argparse.Namespace:
         "--session-id",
         default=None,
         help=(
-            "Optional session ID for SegLST and output filenames. Defaults to the input WAV filename "
+            "Optional session ID for SegLST, RTTM, and output filenames. Defaults to the input WAV filename "
             "without its extension."
         ),
     )
@@ -483,6 +492,7 @@ def json_result(
         "speaker_tag_to_sortformer_column": result["speaker_tag_to_sortformer_column"],
         "alignment": {
             "mode": result["alignment_mode"],
+            "requested_mode": result.get("requested_alignment_mode", result["alignment_mode"]),
             "speaker_assignment_mode": result["speaker_assignment_mode"],
             "ctc_frame_seconds": result["ctc_frame_seconds"],
             "sortformer_frame_seconds": result["sortformer_frame_seconds"],
@@ -714,6 +724,27 @@ def build_seglst_segments(
     )
 
 
+def build_rttm_lines(
+    session_id: str,
+    speaker_word_timestamps: Mapping[str, Any],
+    merge_threshold: float,
+) -> list[str]:
+    """Build standard RTTM speaker segments from merged timestamp words.
+
+    RTTM uses the same t-SOT turn boundaries and ``merge_threshold`` as
+    SegLST and CTM. The recording ID is ``session_id`` and channel is 1.
+    """
+    lines: list[str] = []
+    for speaker_tag, words in _merged_timestamp_word_segments(speaker_word_timestamps, merge_threshold):
+        start = words[0]["start"]
+        end = max(word["end"] for word in words)
+        lines.append(
+            f"SPEAKER {session_id} 1 {start:.3f} {end - start:.3f} "
+            f"<NA> <NA> spk:{speaker_tag} <NA> <NA>"
+        )
+    return lines
+
+
 def _write_text(path: Path, contents: str) -> Path:
     path = path.expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -731,10 +762,16 @@ def write_seglst(path: Path, segments: list[dict[str, Any]]) -> Path:
     return _write_text(path, json.dumps(segments, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
 
 
+def write_rttm(path: Path, lines: list[str]) -> Path:
+    return _write_text(path, "".join(line + "\n" for line in lines))
+
+
 def _validate_output_paths(*paths: Path | None) -> None:
     resolved_paths = [path.expanduser().resolve() for path in paths if path is not None]
     if len(resolved_paths) != len(set(resolved_paths)):
-        raise ValueError("--output-json, --output-ctm, and --output-seglst must refer to different paths.")
+        raise ValueError(
+            "--output-json, --output-ctm, --output-seglst, and --output-rttm must refer to different paths."
+        )
 
 
 def _record_output_stem(session_id: str, manifest_record_index: int | None) -> str:
@@ -758,7 +795,7 @@ def write_record_output_dir(
     output: Mapping[str, Any],
     merge_threshold: float,
 ) -> dict[str, Path]:
-    """Write collision-safe per-record JSON, CTM, and SegLST artifacts."""
+    """Write collision-safe per-record JSON, CTM, SegLST, and RTTM artifacts."""
     root = output_dir.expanduser().resolve()
     stem = _record_output_stem(session_id, manifest_record_index)
     json_path = _write_text(root / "json" / f"{stem}.json", json.dumps(output, ensure_ascii=False, indent=2) + "\n")
@@ -770,12 +807,16 @@ def write_record_output_dir(
         root / "seglst" / f"{stem}.seglst",
         build_seglst_segments(session_id, audio_path, result["speaker_word_timestamps"], merge_threshold),
     )
-    return {"json": json_path, "ctm": ctm_path, "seglst": seglst_path}
+    rttm_path = write_rttm(
+        root / "rttm" / f"{stem}.rttm",
+        build_rttm_lines(session_id, result["speaker_word_timestamps"], merge_threshold),
+    )
+    return {"json": json_path, "ctm": ctm_path, "seglst": seglst_path, "rttm": rttm_path}
 
 
 def main() -> int:
     args = parse_args()
-    _validate_output_paths(args.output_json, args.output_ctm, args.output_seglst)
+    _validate_output_paths(args.output_json, args.output_ctm, args.output_seglst, args.output_rttm)
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be positive.")
 
@@ -805,9 +846,12 @@ def main() -> int:
         raise ValueError("Provide either --input-jsonl or both --audio-file and --transcript.")
 
     multiple_records = len(records) > 1
-    if multiple_records and (args.output_ctm is not None or args.output_seglst is not None):
+    if multiple_records and (
+        args.output_ctm is not None or args.output_seglst is not None or args.output_rttm is not None
+    ):
         raise ValueError(
-            "--output-ctm and --output-seglst accept one recording only; use --output-dir for per-record files."
+            "--output-ctm, --output-seglst, and --output-rttm accept one recording only; "
+            "use --output-dir for per-record files."
         )
 
     device = torch.device(args.device)
@@ -914,7 +958,7 @@ def main() -> int:
                 )
                 print(
                     "Wrote per-record outputs: "
-                    f"{written['json']}, {written['ctm']}, {written['seglst']}",
+                    f"{written['json']}, {written['ctm']}, {written['seglst']}, {written['rttm']}",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -941,6 +985,12 @@ def main() -> int:
                 ),
             )
             print(f"Wrote SegLST: {seglst_path}", file=sys.stderr, flush=True)
+        if args.output_rttm is not None:
+            rttm_path = write_rttm(
+                args.output_rttm,
+                build_rttm_lines(session_id, result["speaker_word_timestamps"], args.merge_threshold),
+            )
+            print(f"Wrote RTTM: {rttm_path}", file=sys.stderr, flush=True)
 
     outputs = [output for _, _, _, _, _, output in completed]
     if len(outputs) == 1:

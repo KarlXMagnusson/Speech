@@ -1259,3 +1259,135 @@ def test_pe_encoder_online_forward_on_gpu():
     assert outputs.shape == (batch_size, _ASR_D_MODEL, expected_t)
     assert expected_t > 0
     assert torch.isfinite(outputs).all()
+
+
+@pytest.mark.unit
+def test_timestamp_extractor_serializes_when_sot_exceeds_active_sortformer_columns(monkeypatch):
+    """t-SOT remains intact when Sortformer has too few active output streams."""
+    blank_id = 3
+    token_ids = {"a": 0, "b": 1}
+
+    def tokenize_words(words, blank, *, alignment_mode):
+        assert blank == blank_id
+        return [dict(word, token_ids=[token_ids[word["word"]]]) for word in words]
+
+    logits = torch.full((7, blank_id + 1), -12.0)
+    for frame_index, label in enumerate([blank_id, 0, 0, blank_id, 1, 1, blank_id]):
+        logits[frame_index, label] = 12.0
+
+    extractor = PEETransformerCTCTimestampExtractor(blank_id=blank_id, alignment_mode="parallel")
+    monkeypatch.setattr(extractor, "_tokenize_words", tokenize_words)
+    result = extractor.extract_from_outputs(
+        ctc_log_probs=torch.log_softmax(logits, dim=-1),
+        sortformer_sigmoids=torch.tensor(
+            [[0.9, 0.1, 0.1]] * 7,
+            dtype=torch.float32,
+        ),
+        sot_transcript="<spk:0> a <spk:1> b",
+        alignment_mode="parallel",
+        parallel_speaker_gate_threshold=None,
+    )
+
+    assert result["requested_alignment_mode"] == "parallel"
+    assert result["alignment_mode"] == "serialized"
+    assert result["speaker_tag_to_sortformer_column"] == {0: None, 1: None}
+    assert result["alignment_diagnostics"]["speaker_count_policy"]["reason"] == (
+        "sot_speakers_exceed_active_sortformer_columns"
+    )
+    rows = sorted(
+        (row for speaker_rows in result["speaker_word_timestamps"].values() for row in speaker_rows),
+        key=lambda row: row["word_index"],
+    )
+    assert [(row["word"], row["speaker_tag"]) for row in rows] == [("a", 0), ("b", 1)]
+
+
+@pytest.mark.unit
+def test_timestamp_extractor_ignores_least_active_extra_sortformer_column(monkeypatch):
+    """Optimal mapping excludes low-total-activity Sortformer columns first."""
+    blank_id = 3
+    token_ids = {"a": 0, "b": 1}
+
+    def tokenize_words(words, blank, *, alignment_mode):
+        assert blank == blank_id
+        return [dict(word, token_ids=[token_ids[word["word"]]]) for word in words]
+
+    logits = torch.full((7, blank_id + 1), -12.0)
+    for frame_index, label in enumerate([blank_id, 0, 0, blank_id, 1, 1, blank_id]):
+        logits[frame_index, label] = 12.0
+    # Column 0 has strong local evidence for the first word but the lowest
+    # total speech mass. The policy must remove it before optimal assignment.
+    sortformer = torch.tensor(
+        [
+            [0.99, 0.80, 0.70],
+            [0.99, 0.80, 0.70],
+            [0.01, 0.80, 0.70],
+            [0.01, 0.80, 0.70],
+            [0.01, 0.80, 0.70],
+            [0.01, 0.80, 0.70],
+            [0.01, 0.80, 0.70],
+        ]
+    )
+
+    extractor = PEETransformerCTCTimestampExtractor(blank_id=blank_id, alignment_mode="parallel")
+    monkeypatch.setattr(extractor, "_tokenize_words", tokenize_words)
+    result = extractor.extract_from_outputs(
+        ctc_log_probs=torch.log_softmax(logits, dim=-1),
+        sortformer_sigmoids=sortformer,
+        sot_transcript="<spk:0> a <spk:1> b",
+        alignment_mode="parallel",
+        speaker_logprob_weight=0.0,
+        parallel_speaker_gate_threshold=None,
+    )
+
+    policy = result["alignment_diagnostics"]["speaker_count_policy"]
+    assert result["alignment_mode"] == "parallel"
+    assert policy["selected_sortformer_columns"] == [1, 2]
+    assert policy["ignored_sortformer_columns"] == [0]
+    assert set(result["speaker_tag_to_sortformer_column"].values()) == {1, 2}
+
+
+@pytest.mark.unit
+def test_timestamp_extractor_batch_applies_speaker_count_policy_per_record(monkeypatch):
+    """One padded batch can contain serialized-fallback and parallel records."""
+    blank_id = 3
+    token_ids = {"a": 0, "b": 1, "c": 2}
+
+    def tokenize_words(words, blank, *, alignment_mode):
+        assert blank == blank_id
+        return [dict(word, token_ids=[token_ids[word["word"]]]) for word in words]
+
+    def make_log_probs(labels, padded_frames=10):
+        logits = torch.full((padded_frames, blank_id + 1), -12.0)
+        for frame_index, label in enumerate(labels):
+            logits[frame_index, label] = 12.0
+        return torch.log_softmax(logits, dim=-1)
+
+    ctc_log_probs = torch.stack(
+        [
+            make_log_probs([blank_id, 0, 0, blank_id, 1, 1, blank_id, 2, 2, blank_id]),
+            make_log_probs([blank_id, 0, 0, blank_id]),
+        ]
+    )
+    sortformer_sigmoids = torch.tensor(
+        [
+            [[0.8, 0.7]] * 10,
+            [[0.1, 0.9]] * 4 + [[0.0, 0.0]] * 6,
+        ]
+    )
+
+    extractor = PEETransformerCTCTimestampExtractor(blank_id=blank_id, alignment_mode="parallel")
+    monkeypatch.setattr(extractor, "_tokenize_words", tokenize_words)
+    results = extractor.extract_from_outputs_batch(
+        ctc_log_probs=ctc_log_probs,
+        sortformer_sigmoids=sortformer_sigmoids,
+        sot_transcripts=["<spk:0> a <spk:1> b <spk:2> c", "<spk:4> a"],
+        ctc_lengths=torch.tensor([10, 4]),
+        sortformer_lengths=torch.tensor([10, 4]),
+        alignment_mode="parallel",
+        speaker_logprob_weight=0.0,
+        parallel_speaker_gate_threshold=None,
+    )
+
+    assert [result["alignment_mode"] for result in results] == ["serialized", "parallel"]
+    assert results[0]["speaker_tag_to_sortformer_column"] == {0: None, 1: None, 2: None}
+    assert results[1]["speaker_tag_to_sortformer_column"] == {4: 1}

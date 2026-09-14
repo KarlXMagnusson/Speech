@@ -82,6 +82,23 @@ _BUNDLE_CONFIG_OVERRIDE_KEYS = frozenset(
 )
 
 
+class _NoValidCTCViterbiPathError(ValueError):
+    """Expose failed padded-stream indices when a CTC Viterbi path is impossible."""
+
+    def __init__(self, failed_stream_indices: Sequence[int], *, active_region_restricted: bool) -> None:
+        indices = tuple(int(index) for index in failed_stream_indices)
+        if not indices:
+            raise ValueError("A CTC Viterbi path error requires at least one failed stream index.")
+        self.failed_stream_indices = indices
+        self.active_region_restricted = bool(active_region_restricted)
+        region_hint = " after restricting to the selected active regions" if self.active_region_restricted else ""
+        super().__init__(
+            "No valid CTC Viterbi path exists for speaker stream(s) "
+            f"{list(indices)}{region_hint}. Lower the active-region threshold, increase the region "
+            "padding or merge gap, or use serialized alignment."
+        )
+
+
 def _disable_max_seq_length_sync(module: nn.Module) -> None:
     """Disable feature-length collectives in every encoder below ``module``."""
     for submodule in module.modules():
@@ -1655,7 +1672,7 @@ class PEETransformerCTCTimestampExtractor:
             per t-SOT speaker tag.  Word ``start`` / ``end`` are CTC-derived seconds;
             Sortformer details are supplied as activity/confidence metadata.
         """
-        mode = self._validate_alignment_mode(alignment_mode or self.alignment_mode)
+        requested_mode = self._validate_alignment_mode(alignment_mode or self.alignment_mode)
         assignment_mode = self._validate_assignment_mode(
             speaker_assignment_mode or self.speaker_assignment_mode
         )
@@ -1723,6 +1740,18 @@ class PEETransformerCTCTimestampExtractor:
         )
 
         parsed_sot_words = self.parse_sot_words(sot_transcript)
+        sot_speaker_tags = self._speaker_tags_in_order(parsed_sot_words)
+        speaker_count_policy = self._resolve_sot_sortformer_count_policy(
+            requested_alignment_mode=requested_mode,
+            speaker_assignment_mode=assignment_mode,
+            speaker_tags=sot_speaker_tags,
+            speaker_probs=sortformer_on_ctc,
+        )
+        mode = speaker_count_policy['effective_alignment_mode']
+        sortformer_for_alignment = (
+            sortformer_on_ctc if speaker_count_policy['use_sortformer_for_alignment'] else None
+        )
+        candidate_sortformer_columns = speaker_count_policy['selected_sortformer_columns']
         tokenized_words = self._tokenize_words(
             parsed_sot_words,
             blank_id,
@@ -1740,6 +1769,7 @@ class PEETransformerCTCTimestampExtractor:
                 'speaker_word_timestamps': {},
                 'speaker_tag_to_sortformer_column': {},
                 'alignment_mode': mode,
+                'requested_alignment_mode': requested_mode,
                 'speaker_assignment_mode': assignment_mode,
                 'ctc_frame_seconds': ctc_step_seconds,
                 'sortformer_frame_seconds': sortformer_step_seconds,
@@ -1748,6 +1778,7 @@ class PEETransformerCTCTimestampExtractor:
                 'num_sortformer_frames': sortformer_length,
                 'ctc_log_normalizer_error': ctc_log_normalizer_error,
                 'alignment_diagnostics': {
+                    'speaker_count_policy': speaker_count_policy,
                     'coarse_alignment_band_size': self.coarse_alignment_band_size,
                 },
             }
@@ -1816,8 +1847,9 @@ class PEETransformerCTCTimestampExtractor:
         speaker_mapping, assignment_scores = self._resolve_speaker_mapping(
             speaker_tags=speaker_tags,
             preliminary_rows=preliminary_rows,
-            speaker_probs=sortformer_on_ctc,
+            speaker_probs=sortformer_for_alignment,
             assignment_mode=assignment_mode,
+            candidate_columns=candidate_sortformer_columns,
         )
 
         alignment_scores: Dict[Optional[int], float] = {}
@@ -1828,7 +1860,7 @@ class PEETransformerCTCTimestampExtractor:
                 tokenized_words=tokenized_words,
                 ctc_log_probs=ctc,
                 blank_id=blank_id,
-                speaker_probs=sortformer_on_ctc,
+                speaker_probs=sortformer_for_alignment,
                 speaker_mapping=speaker_mapping,
                 ctc_step_seconds=ctc_step_seconds,
                 time_offset=time_offset,
@@ -1841,29 +1873,64 @@ class PEETransformerCTCTimestampExtractor:
             parallel_timelines, parallel_active_region_diagnostics = self._build_parallel_active_timelines(
                 tokenized_words=tokenized_words,
                 speaker_mapping=speaker_mapping,
-                speaker_probs=sortformer_on_ctc,
+                speaker_probs=sortformer_for_alignment,
                 ctc_num_frames=ctc.shape[0],
                 ctc_step_seconds=ctc_step_seconds,
                 active_threshold=parallel_gate_threshold,
             )
-            rows, alignment_scores, final_coarse_diagnostics = self._align_parallel_word_streams_batched(
-                tokenized_words=tokenized_words,
-                ctc_log_probs=ctc,
-                blank_id=blank_id,
-                speaker_probs=sortformer_on_ctc,
-                speaker_mapping=speaker_mapping,
-                ctc_step_seconds=ctc_step_seconds,
-                time_offset=time_offset,
-                speaker_logprob_weight=float(speaker_weight),
-                # The compact timeline excludes frames outside the padded
-                # Sortformer-active regions. Do not hard-mask token emissions
-                # again inside its collar: genuine onset/offset phones can fall
-                # just below the activity threshold, while the soft prior and
-                # t-SOT turn fences still constrain the path.
-                speaker_gate_threshold=None,
-                speaker_timelines=parallel_timelines,
-                word_source_frame_bounds=parallel_turn_word_bounds or None,
-            )
+            parallel_stream_tags = list(self._group_words_by_speaker(tokenized_words))
+            try:
+                rows, alignment_scores, final_coarse_diagnostics = self._align_parallel_word_streams_batched(
+                    tokenized_words=tokenized_words,
+                    ctc_log_probs=ctc,
+                    blank_id=blank_id,
+                    speaker_probs=sortformer_for_alignment,
+                    speaker_mapping=speaker_mapping,
+                    ctc_step_seconds=ctc_step_seconds,
+                    time_offset=time_offset,
+                    speaker_logprob_weight=float(speaker_weight),
+                    # The compact timeline excludes frames outside the padded
+                    # Sortformer-active regions. Do not hard-mask token emissions
+                    # again inside its collar: genuine onset/offset phones can fall
+                    # just below the activity threshold, while the soft prior and
+                    # t-SOT turn fences still constrain the path.
+                    speaker_gate_threshold=None,
+                    speaker_timelines=parallel_timelines,
+                    word_source_frame_bounds=parallel_turn_word_bounds or None,
+                )
+            except _NoValidCTCViterbiPathError as error:
+                if parallel_gate_threshold is None:
+                    raise
+                failed_speaker_tags: List[Optional[int]] = []
+                for failed_stream_index in error.failed_stream_indices:
+                    if not 0 <= failed_stream_index < len(parallel_stream_tags):
+                        raise RuntimeError("CTC Viterbi reported an invalid parallel stream index.") from error
+                    speaker_tag = parallel_stream_tags[failed_stream_index]
+                    diagnostic = parallel_active_region_diagnostics.get(speaker_tag, {})
+                    if bool(diagnostic.get('constrained_to_active_regions', False)):
+                        failed_speaker_tags.append(speaker_tag)
+                if not failed_speaker_tags:
+                    raise
+                for speaker_tag in failed_speaker_tags:
+                    parallel_timelines[speaker_tag] = self._full_ctc_timeline(ctc.shape[0])
+                    self._mark_full_timeline_fallback(
+                        parallel_active_region_diagnostics,
+                        speaker_tag,
+                        ctc.shape[0],
+                    )
+                rows, alignment_scores, final_coarse_diagnostics = self._align_parallel_word_streams_batched(
+                    tokenized_words=tokenized_words,
+                    ctc_log_probs=ctc,
+                    blank_id=blank_id,
+                    speaker_probs=sortformer_for_alignment,
+                    speaker_mapping=speaker_mapping,
+                    ctc_step_seconds=ctc_step_seconds,
+                    time_offset=time_offset,
+                    speaker_logprob_weight=float(speaker_weight),
+                    speaker_gate_threshold=None,
+                    speaker_timelines=parallel_timelines,
+                    word_source_frame_bounds=parallel_turn_word_bounds or None,
+                )
 
         speaker_word_timestamps: Dict[Optional[int], List[Dict[str, Any]]] = {}
         for row in rows:
@@ -1873,6 +1940,7 @@ class PEETransformerCTCTimestampExtractor:
             'speaker_word_timestamps': speaker_word_timestamps,
             'speaker_tag_to_sortformer_column': speaker_mapping,
             'alignment_mode': mode,
+            'requested_alignment_mode': requested_mode,
             'speaker_assignment_mode': assignment_mode,
             'ctc_frame_seconds': ctc_step_seconds,
             'sortformer_frame_seconds': sortformer_step_seconds,
@@ -1884,6 +1952,7 @@ class PEETransformerCTCTimestampExtractor:
                 'preliminary_ctc_path_scores': preliminary_scores,
                 'final_path_scores': alignment_scores,
                 'speaker_assignment_scores': assignment_scores,
+                'speaker_count_policy': speaker_count_policy,
                 'parallel_speaker_gate_threshold': parallel_gate_threshold if mode == 'parallel' else None,
                 'parallel_active_regions': parallel_active_region_diagnostics if mode == 'parallel' else {},
                 'parallel_active_region_padding_seconds': self.parallel_active_region_padding_seconds,
@@ -1939,7 +2008,7 @@ class PEETransformerCTCTimestampExtractor:
         if batch_size == 0 or max_ctc_frames == 0 or ctc_vocab_size < 2:
             raise ValueError("ctc_log_probs must contain a non-empty batch, time grid, and CTC vocabulary.")
         self._validate_sot_transcripts(sot_transcripts, batch_size)
-        mode = self._validate_alignment_mode(alignment_mode or self.alignment_mode)
+        requested_mode = self._validate_alignment_mode(alignment_mode or self.alignment_mode)
         assignment_mode = self._validate_assignment_mode(
             speaker_assignment_mode or self.speaker_assignment_mode
         )
@@ -2024,12 +2093,26 @@ class PEETransformerCTCTimestampExtractor:
                 ctc_step_seconds,
             )
             parsed_sot_words = self.parse_sot_words(sot_transcripts[record_index])
+            sot_speaker_tags = self._speaker_tags_in_order(parsed_sot_words)
+            speaker_count_policy = self._resolve_sot_sortformer_count_policy(
+                requested_alignment_mode=requested_mode,
+                speaker_assignment_mode=assignment_mode,
+                speaker_tags=sot_speaker_tags,
+                speaker_probs=sortformer_on_ctc,
+            )
+            record_mode = speaker_count_policy['effective_alignment_mode']
+            sortformer_for_alignment = (
+                sortformer_on_ctc if speaker_count_policy['use_sortformer_for_alignment'] else None
+            )
+            candidate_sortformer_columns = speaker_count_policy['selected_sortformer_columns']
             tokenized_words = self._tokenize_words(
                 parsed_sot_words,
                 blank_id,
-                alignment_mode=mode,
+                alignment_mode=record_mode,
             )
-            needs_parallel_turn_fences = mode == 'parallel' and self._has_repeated_speaker_turns(tokenized_words)
+            needs_parallel_turn_fences = (
+                record_mode == 'parallel' and self._has_repeated_speaker_turns(tokenized_words)
+            )
             serialized_turn_anchor_words = (
                 self._tokenize_words(parsed_sot_words, blank_id, alignment_mode='serialized')
                 if needs_parallel_turn_fences
@@ -2040,11 +2123,16 @@ class PEETransformerCTCTimestampExtractor:
                     'record_index': record_index,
                     'ctc': ctc,
                     'sortformer_on_ctc': sortformer_on_ctc,
+                    'sortformer_for_alignment': sortformer_for_alignment,
                     'sortformer_length': sortformer_length,
                     'ctc_step_seconds': ctc_step_seconds,
                     'sortformer_step_seconds': sortformer_step_seconds,
                     'time_offset': time_offset,
                     'ctc_log_normalizer_error': ctc_log_normalizer_error,
+                    'requested_alignment_mode': requested_mode,
+                    'alignment_mode': record_mode,
+                    'speaker_count_policy': speaker_count_policy,
+                    'candidate_sortformer_columns': candidate_sortformer_columns,
                     'tokenized_words': tokenized_words,
                     'serialized_turn_anchor_words': serialized_turn_anchor_words,
                     'parallel_turn_word_bounds': {},
@@ -2064,7 +2152,7 @@ class PEETransformerCTCTimestampExtractor:
                 continue
             results[record['record_index']] = self._build_batched_alignment_result(
                 record=record,
-                alignment_mode=mode,
+                alignment_mode=record['alignment_mode'],
                 speaker_assignment_mode=assignment_mode,
                 speaker_mapping={},
                 rows=[],
@@ -2099,7 +2187,7 @@ class PEETransformerCTCTimestampExtractor:
 
         preliminary_streams: List[Dict[str, Any]] = []
         for record in active_records:
-            if mode == 'serialized':
+            if record['alignment_mode'] == 'serialized':
                 stream_groups = [(None, record['tokenized_words'])]
             else:
                 stream_groups = list(self._group_words_by_speaker(record['tokenized_words']).items())
@@ -2218,8 +2306,9 @@ class PEETransformerCTCTimestampExtractor:
             speaker_mapping, assignment_scores = self._resolve_speaker_mapping(
                 speaker_tags=record['speaker_tags'],
                 preliminary_rows=preliminary_rows[record_index],
-                speaker_probs=record['sortformer_on_ctc'],
+                speaker_probs=record['sortformer_for_alignment'],
                 assignment_mode=assignment_mode,
+                candidate_columns=record['candidate_sortformer_columns'],
             )
             record['speaker_mapping'] = speaker_mapping
             record['assignment_scores'] = assignment_scores
@@ -2229,7 +2318,7 @@ class PEETransformerCTCTimestampExtractor:
             int(record['record_index']): {} for record in active_records
         }
         for record in active_records:
-            if mode == 'serialized':
+            if record['alignment_mode'] == 'serialized':
                 num_frames = int(record['ctc'].shape[0])
                 final_streams.append(
                     self._build_batched_record_stream(
@@ -2269,17 +2358,62 @@ class PEETransformerCTCTimestampExtractor:
                     )
                 )
 
-        final_alignment = self._align_record_streams_batched(
-            streams=final_streams,
-            ctc_log_probs=global_ctc,
-            speaker_probs=global_speaker_probs,
-            blank_id=blank_id,
-            speaker_logprob_weight=float(speaker_weight),
-            # The parallel timeline itself is the hard active-region selection.
-            # Keep its padded collar available for CTC onset/offset tokens.
-            speaker_gate_threshold=None,
-            use_coarse_alignment=True,
-        )
+        fallback_stream_indices: set[int] = set()
+        while True:
+            try:
+                final_alignment = self._align_record_streams_batched(
+                    streams=final_streams,
+                    ctc_log_probs=global_ctc,
+                    speaker_probs=global_speaker_probs,
+                    blank_id=blank_id,
+                    speaker_logprob_weight=float(speaker_weight),
+                    # The parallel timeline itself is the hard active-region selection.
+                    # Keep its padded collar available for CTC onset/offset tokens.
+                    speaker_gate_threshold=None,
+                    use_coarse_alignment=True,
+                )
+                break
+            except _NoValidCTCViterbiPathError as error:
+                if parallel_gate_threshold is None:
+                    raise
+                newly_failed_indices: List[int] = []
+                for failed_stream_index in error.failed_stream_indices:
+                    if not 0 <= failed_stream_index < len(final_streams):
+                        raise RuntimeError("CTC Viterbi reported an invalid batched parallel stream index.") from error
+                    if failed_stream_index in fallback_stream_indices:
+                        continue
+                    stream = final_streams[failed_stream_index]
+                    record = stream['record']
+                    if record['alignment_mode'] != 'parallel':
+                        continue
+                    record_index = int(record['record_index'])
+                    diagnostic = parallel_active_region_diagnostics[record_index].get(stream['stream_key'], {})
+                    if bool(diagnostic.get('constrained_to_active_regions', False)):
+                        newly_failed_indices.append(failed_stream_index)
+                if not newly_failed_indices:
+                    raise
+                for failed_stream_index in newly_failed_indices:
+                    stream = final_streams[failed_stream_index]
+                    record = stream['record']
+                    record_index = int(record['record_index'])
+                    num_frames = int(record['ctc'].shape[0])
+                    full_timeline = self._full_ctc_timeline(num_frames)
+                    final_streams[failed_stream_index] = self._build_batched_record_stream(
+                        record=record,
+                        stream_key=stream['stream_key'],
+                        tokenized_words=stream['tokenized_words'],
+                        blank_id=blank_id,
+                        speaker_mapping=record['speaker_mapping'],
+                        source_frame_indices=full_timeline['source_frame_indices'],
+                        active_region_ids=full_timeline['region_ids'],
+                        word_source_frame_bounds=record['parallel_turn_word_bounds'] or None,
+                    )
+                    self._mark_full_timeline_fallback(
+                        parallel_active_region_diagnostics[record_index],
+                        stream['stream_key'],
+                        num_frames,
+                    )
+                    fallback_stream_indices.add(failed_stream_index)
         final_rows: Dict[int, List[Dict[str, Any]]] = {
             int(record['record_index']): [] for record in active_records
         }
@@ -2315,7 +2449,7 @@ class PEETransformerCTCTimestampExtractor:
             record_index = int(record['record_index'])
             results[record_index] = self._build_batched_alignment_result(
                 record=record,
-                alignment_mode=mode,
+                alignment_mode=record['alignment_mode'],
                 speaker_assignment_mode=assignment_mode,
                 speaker_mapping=record['speaker_mapping'],
                 rows=final_rows[record_index],
@@ -2504,6 +2638,7 @@ class PEETransformerCTCTimestampExtractor:
             'speaker_word_timestamps': speaker_word_timestamps,
             'speaker_tag_to_sortformer_column': speaker_mapping,
             'alignment_mode': alignment_mode,
+            'requested_alignment_mode': record.get('requested_alignment_mode', alignment_mode),
             'speaker_assignment_mode': speaker_assignment_mode,
             'ctc_frame_seconds': record['ctc_step_seconds'],
             'sortformer_frame_seconds': record['sortformer_step_seconds'],
@@ -2515,6 +2650,7 @@ class PEETransformerCTCTimestampExtractor:
                 'preliminary_ctc_path_scores': dict(preliminary_scores),
                 'final_path_scores': dict(final_scores),
                 'speaker_assignment_scores': dict(assignment_scores),
+                'speaker_count_policy': dict(record.get('speaker_count_policy', {})),
                 'parallel_speaker_gate_threshold': parallel_gate_threshold if alignment_mode == 'parallel' else None,
                 'parallel_active_regions': (
                     dict(parallel_active_region_diagnostics) if alignment_mode == 'parallel' else {}
@@ -2679,6 +2815,97 @@ class PEETransformerCTCTimestampExtractor:
                 f"valid non-blank IDs are [0, {blank_id})."
             )
         return token_ids
+
+    def _resolve_sot_sortformer_count_policy(
+        self,
+        *,
+        requested_alignment_mode: str,
+        speaker_assignment_mode: str,
+        speaker_tags: Sequence[int],
+        speaker_probs: Optional[torch.Tensor],
+    ) -> Dict[str, Any]:
+        """Treat t-SOT speakers as authoritative and Sortformer as auxiliary.
+
+        A Sortformer stream counts as active when it has at least one frame at
+        ``speaker_activity_threshold``. If t-SOT has more speakers than those
+        active streams, a requested parallel alignment is downgraded to pure
+        serialized CTC. Otherwise, optimal assignment is restricted to the most
+        active raw Sortformer columns, leaving extra streams unused.
+        """
+        tags = list(speaker_tags)
+        if len(tags) != len(set(tags)):
+            raise ValueError('speaker_tags must contain distinct t-SOT speaker tags.')
+
+        policy: Dict[str, Any] = {
+            'requested_alignment_mode': requested_alignment_mode,
+            'effective_alignment_mode': requested_alignment_mode,
+            'sot_speaker_count': len(tags),
+            'sot_speaker_tags': tags,
+            'sortformer_column_count': None,
+            'sortformer_active_column_count': None,
+            'sortformer_active_columns': [],
+            'sortformer_column_activity_mass': [],
+            'selected_sortformer_columns': [],
+            'ignored_sortformer_columns': [],
+            'use_sortformer_for_alignment': speaker_probs is not None,
+            'reason': 'no_sortformer_output',
+        }
+        if speaker_probs is None:
+            return policy
+        if speaker_probs.ndim != 2 or speaker_probs.shape[1] == 0:
+            raise ValueError('speaker_probs must have shape (frames, non-empty speakers).')
+
+        probs = speaker_probs.detach().to(device='cpu', dtype=torch.float32)
+        num_columns = int(probs.shape[1])
+        activity_mass = probs.sum(dim=0)
+        activity_values = [float(value) for value in activity_mass.tolist()]
+        active_columns = torch.nonzero(
+            (probs >= self.speaker_activity_threshold).any(dim=0), as_tuple=False
+        ).flatten().tolist()
+        policy['sortformer_column_count'] = num_columns
+        policy['sortformer_active_column_count'] = len(active_columns)
+        policy['sortformer_active_columns'] = active_columns
+        policy['sortformer_column_activity_mass'] = activity_values
+
+        if not tags:
+            policy['reason'] = 'no_explicit_sot_speaker_tags'
+            return policy
+
+        if len(tags) > len(active_columns):
+            # There cannot be a reliable one-to-one t-SOT-to-Sortformer mapping.
+            # Keep the complete transcript and rely only on its serialized CTC path.
+            policy.update(
+                {
+                    'effective_alignment_mode': 'serialized',
+                    'selected_sortformer_columns': [],
+                    'ignored_sortformer_columns': list(range(num_columns)),
+                    'use_sortformer_for_alignment': False,
+                    'reason': 'sot_speakers_exceed_active_sortformer_columns',
+                }
+            )
+            return policy
+
+        if speaker_assignment_mode == 'identity':
+            # Identity is an explicit user override: tag N remains column N, but
+            # every unreferenced column is still ignored.
+            selected_columns = [tag for tag in tags if 0 <= tag < num_columns]
+            policy['reason'] = 'identity_assignment_preserves_tag_columns'
+        else:
+            ranked_columns = sorted(active_columns, key=lambda column: (-activity_values[column], column))
+            selected_columns = ranked_columns[: len(tags)]
+            policy['reason'] = (
+                'sot_and_active_sortformer_speaker_counts_match'
+                if len(tags) == len(active_columns)
+                else 'sot_speakers_fewer_than_active_sortformer_columns'
+            )
+
+        selected_set = set(selected_columns)
+        policy['selected_sortformer_columns'] = selected_columns
+        policy['ignored_sortformer_columns'] = [
+            column for column in range(num_columns) if column not in selected_set
+        ]
+        return policy
+
 
     @staticmethod
     def _speaker_tags_in_order(tokenized_words: Sequence[Dict[str, Any]]) -> List[int]:
@@ -3000,6 +3227,37 @@ class PEETransformerCTCTimestampExtractor:
                 'virtual_separator_count': max(0, len(merged_regions) - 1),
             }
         return timelines, diagnostics
+
+    @staticmethod
+    def _full_ctc_timeline(ctc_num_frames: int) -> Dict[str, torch.Tensor]:
+        """Return the uncompressed CTC timeline used for an active-region fallback."""
+        if ctc_num_frames <= 0:
+            raise ValueError("ctc_num_frames must be positive.")
+        return {
+            'source_frame_indices': torch.arange(ctc_num_frames, dtype=torch.long),
+            'region_ids': torch.zeros(ctc_num_frames, dtype=torch.long),
+        }
+
+    @staticmethod
+    def _mark_full_timeline_fallback(
+        diagnostics: Dict[Optional[int], Dict[str, Any]],
+        speaker_tag: Optional[int],
+        ctc_num_frames: int,
+    ) -> None:
+        """Record that one speaker stream had to leave its compact active regions."""
+        diagnostic = diagnostics.get(speaker_tag)
+        if diagnostic is None:
+            raise RuntimeError(f"Missing active-region diagnostics for speaker tag {speaker_tag!r}.")
+        diagnostics[speaker_tag] = {
+            **diagnostic,
+            'active_region_fallback': {
+                'mode': 'full_ctc_timeline',
+                'reason': 'no_valid_ctc_viterbi_path',
+                'initial_selected_ctc_frames': int(diagnostic.get('selected_ctc_frames', 0)),
+                'initial_virtual_separator_count': int(diagnostic.get('virtual_separator_count', 0)),
+                'fallback_selected_ctc_frames': int(ctc_num_frames),
+            },
+        }
 
     def _align_word_sequence(
         self,
@@ -3552,11 +3810,9 @@ class PEETransformerCTCTimestampExtractor:
         final_scores = torch.where(choose_token, last_token_scores, last_blank_scores)
         if not torch.isfinite(final_scores).all():
             failed_streams = torch.nonzero(~torch.isfinite(final_scores), as_tuple=False).flatten().tolist()
-            region_hint = " after restricting to the selected active regions" if virtual_time_mask.any() else ""
-            raise ValueError(
-                "No valid CTC Viterbi path exists for speaker stream(s) "
-                f"{failed_streams}{region_hint}. Lower the active-region threshold, increase the region "
-                "padding or merge gap, or use serialized alignment."
+            raise _NoValidCTCViterbiPathError(
+                failed_streams,
+                active_region_restricted=bool(virtual_time_mask.any().item()),
             )
 
         paths = torch.full((num_streams, max_time), -1, dtype=torch.long)
@@ -3917,22 +4173,33 @@ class PEETransformerCTCTimestampExtractor:
         fallback_scores: Dict[int, float] = {}
         if fallback_stream_indices:
             fallback_index_tensor = torch.tensor(fallback_stream_indices, dtype=torch.long)
-            dense_paths, dense_scores, _ = self._ctc_viterbi_align_batched(
-                ctc_log_probs=log_probs,
-                labels=labels[fallback_index_tensor],
-                state_lengths=state_lengths[fallback_index_tensor],
-                blank_id=blank_id,
-                state_speaker_columns=state_speaker_columns[fallback_index_tensor],
-                speaker_probs=speaker_probs,
-                speaker_logprob_weight=speaker_logprob_weight,
-                speaker_gate_threshold=speaker_gate_threshold,
-                source_frame_indices=source_frame_indices[fallback_index_tensor],
-                time_lengths=time_lengths[fallback_index_tensor],
-                separator_state_mask=separator_state_mask[fallback_index_tensor],
-                state_min_source_frames=state_min_source_frames[fallback_index_tensor],
-                state_max_source_frames=state_max_source_frames[fallback_index_tensor],
-                use_coarse_alignment=False,
-            )
+            try:
+                dense_paths, dense_scores, _ = self._ctc_viterbi_align_batched(
+                    ctc_log_probs=log_probs,
+                    labels=labels[fallback_index_tensor],
+                    state_lengths=state_lengths[fallback_index_tensor],
+                    blank_id=blank_id,
+                    state_speaker_columns=state_speaker_columns[fallback_index_tensor],
+                    speaker_probs=speaker_probs,
+                    speaker_logprob_weight=speaker_logprob_weight,
+                    speaker_gate_threshold=speaker_gate_threshold,
+                    source_frame_indices=source_frame_indices[fallback_index_tensor],
+                    time_lengths=time_lengths[fallback_index_tensor],
+                    separator_state_mask=separator_state_mask[fallback_index_tensor],
+                    state_min_source_frames=state_min_source_frames[fallback_index_tensor],
+                    state_max_source_frames=state_max_source_frames[fallback_index_tensor],
+                    use_coarse_alignment=False,
+                )
+            except _NoValidCTCViterbiPathError as error:
+                mapped_failed_streams: List[int] = []
+                for failed_stream_index in error.failed_stream_indices:
+                    if not 0 <= failed_stream_index < len(fallback_stream_indices):
+                        raise RuntimeError("Dense coarse fallback reported an invalid stream index.") from error
+                    mapped_failed_streams.append(fallback_stream_indices[failed_stream_index])
+                raise _NoValidCTCViterbiPathError(
+                    mapped_failed_streams,
+                    active_region_restricted=error.active_region_restricted,
+                ) from error
             for fallback_batch_index, stream_index in enumerate(fallback_stream_indices):
                 fallback_paths[stream_index] = dense_paths[fallback_batch_index]
                 fallback_scores[stream_index] = dense_scores[fallback_batch_index]
@@ -4680,20 +4947,49 @@ class PEETransformerCTCTimestampExtractor:
         preliminary_rows: Sequence[Dict[str, Any]],
         speaker_probs: Optional[torch.Tensor],
         assignment_mode: str,
+        candidate_columns: Optional[Sequence[int]] = None,
     ) -> Tuple[Dict[int, Optional[int]], Dict[int, List[float]]]:
-        """Map t-SOT tags to raw Sortformer columns using preliminary CTC spans."""
+        """Map t-SOT tags to selected raw Sortformer columns.
+
+        ``candidate_columns`` restricts the optimal one-to-one assignment without
+        renumbering Sortformer outputs, so emitted ``sortformer_column`` metadata
+        always remains a raw model column index.
+        """
         mapping: Dict[int, Optional[int]] = {tag: None for tag in speaker_tags}
         assignment_scores: Dict[int, List[float]] = {}
         if speaker_probs is None:
             return mapping, assignment_scores
 
-        num_columns = speaker_probs.shape[1]
+        num_columns = int(speaker_probs.shape[1])
+        if candidate_columns is None:
+            candidates = list(range(num_columns))
+        else:
+            candidates = [int(column) for column in candidate_columns]
+            if len(candidates) != len(set(candidates)):
+                raise ValueError('candidate_columns must not contain duplicates.')
+            invalid_columns = [column for column in candidates if not 0 <= column < num_columns]
+            if invalid_columns:
+                raise ValueError(
+                    f'candidate_columns contains invalid Sortformer column(s): {invalid_columns}.'
+                )
+        if len(speaker_tags) > len(candidates):
+            raise ValueError(
+                'Cannot assign more t-SOT speakers than selected Sortformer columns. '
+                'Use serialized alignment or provide enough candidate columns.'
+            )
+
         if assignment_mode == 'identity':
             invalid_tags = [tag for tag in speaker_tags if not 0 <= tag < num_columns]
             if invalid_tags:
                 raise ValueError(
                     "speaker_assignment_mode='identity' requires each t-SOT tag to match a "
                     f"Sortformer column; invalid tag(s): {invalid_tags}."
+                )
+            excluded_tags = [tag for tag in speaker_tags if tag not in candidates]
+            if excluded_tags:
+                raise ValueError(
+                    "speaker_assignment_mode='identity' conflicts with the selected Sortformer columns; "
+                    f'tag(s) {excluded_tags} are unavailable.'
                 )
             valid_tags = list(speaker_tags)
         else:
@@ -4725,8 +5021,9 @@ class PEETransformerCTCTimestampExtractor:
                 mapping[tag] = tag
             return mapping, assignment_scores
 
-        for tag, column in zip(valid_tags, self._maximum_weight_assignment(score_matrix)):
-            mapping[tag] = column
+        candidate_score_matrix = [[row[column] for column in candidates] for row in score_matrix]
+        for tag, candidate_index in zip(valid_tags, self._maximum_weight_assignment(candidate_score_matrix)):
+            mapping[tag] = candidates[candidate_index]
         return mapping, assignment_scores
 
     @staticmethod
