@@ -35,7 +35,7 @@ from nemo.core.classes.common import Model, safe_instantiate
 from nemo.core.classes.module import NeuralModule
 from nemo.core.connectors.save_restore_connector import SaveRestoreConnector
 from nemo.core.optim import prepare_lr_scheduler
-from nemo.lightning.callback_group import CallbackGroup, callback_context, hook_class_init_with_callbacks
+from nemo.lightning.callback_group import CallbackGroup, callback_context, with_model_init_callbacks
 from nemo.utils import logging, model_utils
 from nemo.utils.app_state import AppState
 from nemo.utils.debug_hook import register_debug_hooks
@@ -228,7 +228,7 @@ class ModelPT(LightningModule, Model):
 
     def __init_subclass__(cls) -> None:
         cls._save_restore_connector = SaveRestoreConnector()
-        hook_class_init_with_callbacks(cls, 'on_model_init_start', 'on_model_init_end')
+        with_model_init_callbacks(cls)
 
     def on_fit_start(self) -> None:
         """

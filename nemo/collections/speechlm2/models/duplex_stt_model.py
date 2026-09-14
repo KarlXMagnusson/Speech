@@ -51,6 +51,7 @@ from nemo.collections.speechlm2.parts.pretrained import (
 )
 from nemo.collections.speechlm2.streaming.duplex_stt_inference import DuplexSTTStreamingInference
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
+from nemo.lightning.callback_group import with_model_init_callbacks
 from nemo.utils import logging
 
 
@@ -65,6 +66,7 @@ def maybe_rename_llm_kwargs_for_nemotron(kwargs: dict, model_cfg) -> dict:
     return kwargs
 
 
+@with_model_init_callbacks
 class DuplexSTTModel(LightningModule, HFHubMixin):
     def __init__(self, cfg: dict) -> None:
         assert isinstance(cfg, dict), (

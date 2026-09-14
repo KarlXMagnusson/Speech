@@ -12,8 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from nemo.lightning.callback_group import hook_class_init_with_callbacks
-
 from .data import DataModule, DuplexEARTTSDataset, DuplexS2SDataset, DuplexSTTDataset, SALMDataset
 from .models import (
     SALM,
@@ -25,18 +23,6 @@ from .models import (
     SALMAutomodel,
     SALMWithAsrDecoder,
 )
-
-for _model_class in (
-    SALM,
-    DuplexEARTTS,
-    DuplexS2SModel,
-    DuplexS2SSpeechDecoderModel,
-    DuplexSTTModel,
-    SALMAutomodel,
-    SALMWithAsrDecoder,
-):
-    hook_class_init_with_callbacks(_model_class, 'on_model_init_start', 'on_model_init_end')
-del _model_class
 
 __all__ = [
     'DataModule',

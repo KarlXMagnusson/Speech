@@ -190,6 +190,12 @@ def hook_class_init_with_callbacks(cls, start_callback: str, end_callback: str) 
     cls.__init__ = wrapped_init
 
 
+def with_model_init_callbacks(cls):
+    """Decorate a model class to emit callbacks around its initialization."""
+    hook_class_init_with_callbacks(cls, 'on_model_init_start', 'on_model_init_end')
+    return cls
+
+
 @contextmanager
 def callback_context(start_callback: str, end_callback: str, *args, **kwargs) -> Iterator[None]:
     """Emit a paired lifecycle callback around an operation."""
@@ -222,4 +228,10 @@ CallbackGroup.get_instance()
 # non-Hydra entrypoints). Safe due to idempotent on_app_end.
 atexit.register(lambda: CallbackGroup.get_instance().on_app_end())
 
-__all__ = ['CallbackGroup', 'callback_context', 'hook_class_init_with_callbacks', 'with_callback_context']
+__all__ = [
+    'CallbackGroup',
+    'callback_context',
+    'hook_class_init_with_callbacks',
+    'with_callback_context',
+    'with_model_init_callbacks',
+]

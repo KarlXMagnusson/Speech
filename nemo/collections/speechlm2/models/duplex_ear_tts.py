@@ -57,9 +57,11 @@ from nemo.collections.speechlm2.parts.pretrained import (
     load_pretrained_hf,
     set_model_dict_for_partial_init,
 )
+from nemo.lightning.callback_group import with_model_init_callbacks
 from nemo.utils import logging
 
 
+@with_model_init_callbacks
 class DuplexEARTTS(LightningModule, HFHubMixin):
     def __init__(self, cfg: dict) -> None:
         assert isinstance(cfg, dict), (

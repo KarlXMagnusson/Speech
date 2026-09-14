@@ -25,7 +25,7 @@ from omegaconf import OmegaConf
 
 from nemo.core.classes.modelPT import ModelPT
 from nemo.lightning.base_callback import BaseCallback
-from nemo.lightning.callback_group import CallbackGroup, callback_context
+from nemo.lightning.callback_group import CallbackGroup, callback_context, with_model_init_callbacks
 from nemo.lightning.one_logger_callback import (
     OneLoggerNeMoCallback,
     _get_base_callback_config,
@@ -413,6 +413,20 @@ class TestOneLoggerCallback:
         group = MagicMock()
         with patch('nemo.lightning.callback_group.CallbackGroup.get_instance', return_value=group):
             ChildModel()
+
+        group.on_model_init_start.assert_called_once_with()
+        group.on_model_init_end.assert_called_once_with()
+
+    @pytest.mark.unit
+    def test_model_class_decorator_emits_one_paired_span(self):
+        @with_model_init_callbacks
+        class Model:
+            def __init__(self):
+                pass
+
+        group = MagicMock()
+        with patch('nemo.lightning.callback_group.CallbackGroup.get_instance', return_value=group):
+            Model()
 
         group.on_model_init_start.assert_called_once_with()
         group.on_model_init_end.assert_called_once_with()

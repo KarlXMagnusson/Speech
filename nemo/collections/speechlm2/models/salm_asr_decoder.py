@@ -50,9 +50,11 @@ from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
 from nemo.collections.speechlm2.parts.pretrained import load_pretrained_hf, move_embedding
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, MaskType, NeuralType
+from nemo.lightning.callback_group import with_model_init_callbacks
 from nemo.utils import logging
 
 
+@with_model_init_callbacks
 class SALMWithAsrDecoder(LightningModule, HFHubMixin):
     def __init__(self, cfg) -> None:
         assert isinstance(cfg, dict), (
