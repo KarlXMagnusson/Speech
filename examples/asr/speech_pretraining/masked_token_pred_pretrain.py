@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import lightning.pytorch as pl
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 
 from nemo.collections.asr.models.ssl_models import EncDecDenoiseMaskedTokenPredModel
 from nemo.core.config import hydra_runner
@@ -48,7 +48,8 @@ python pretrain_masked_token_pred.py \
 
 
 @hydra_runner(config_path="../conf/ssl/nest", config_name="nest_fast-conformer")
-def main(cfg):
+def main(cfg: DictConfig):
+    OmegaConf.resolve(cfg)
     logging.info(f"Hydra config: {OmegaConf.to_yaml(cfg)}")
 
     trainer = pl.Trainer(**resolve_trainer_cfg(cfg.trainer))
