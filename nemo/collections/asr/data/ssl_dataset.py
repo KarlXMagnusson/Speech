@@ -479,78 +479,6 @@ class TarredAudioNoiseDataset(audio_to_text.TarredAudioToCharDataset):
         return _audio_noise_collate_fn(batch, self.batch_augmentor, self.return_noise)
 
 
-def maybe_convert_cuts_to_mono(cuts: CutSet) -> CutSet:
-    """
-    Convert the cuts to mono if they are not already mono.
-    Args:
-        cuts: the cuts to convert
-    Returns:
-        the converted cuts
-    """
-    resolved_cuts = []
-    for cut in cuts:
-        try:
-            resolved_cuts.append(cut.move_to_memory())
-        except Exception:
-            if isinstance(cut, MixedCut):
-                cut.first_non_padding_cut.recording.sources[0].channel_ids = [0, 1]
-                cut.first_non_padding_cut = MultiCut.from_dict(cut.first_non_padding_cut.to_dict())
-            else:
-                cut.recording.sources[0].channel_ids = [0, 1]
-                cut = MultiCut.from_dict(cut.to_dict())
-            try:
-                resolved_cuts.append(cut.to_mono(mono_downmix=True))
-            except Exception as e:
-                logging.warning(f"Error converting cut to mono: {cut}, with exception: {e}. Skipping this cut.")
-                continue
-    resolved_cuts = CutSet(resolved_cuts)
-    return resolved_cuts
-
-
-def safe_load_and_convert_to_mono(cut: Cut) -> Tensor:
-    """
-    Load the audio safely.
-    Args:
-        cut: the cut to load
-    Returns:
-        the loaded audio
-    """
-    try:
-        audio = cut.load_audio()
-        if audio.ndim == 2:
-            audio = audio.mean(axis=0)
-        return audio
-    except Exception as e:
-        logging.warning(f"Error loading audio: {cut}, with exception: {e}. Skipping this cut.")
-        return None
-
-
-def safe_collate_audios(cuts: CutSet) -> tuple[Tensor, Tensor, CutSet]:
-    """
-    Collate the audios safely.
-    Args:
-        cuts: the cuts to collate
-    Returns:
-        the collated audios, audio lengths, and cuts
-    """
-    loaded_audios = []
-    loaded_audio_lens = []
-    loaded_cuts = []
-    for cut in cuts:
-        audio = safe_load_and_convert_to_mono(cut)
-        if audio is not None:
-            loaded_audios.append(audio)
-            loaded_audio_lens.append(audio.shape[0])
-            loaded_cuts.append(cut)
-
-    if len(loaded_audios) == 0:
-        return None, None, None
-    loaded_audios = collate_vectors(loaded_audios)
-    loaded_audio_lens = torch.tensor(loaded_audio_lens).long()
-    loaded_cuts = CutSet(loaded_cuts)
-    return loaded_audios, loaded_audio_lens, loaded_cuts
-
-
 class LhotseAudioNoiseDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -581,12 +509,6 @@ class LhotseAudioNoiseDataset(torch.utils.data.Dataset):
         self.cfg = cfg
 
     def __getitem__(self, cuts: CutSet) -> AudioNoiseBatch:
-        # if self.use_ais_get_batch:
-        #     cuts = cuts.to_eager()
-        #     audios, audio_lens, cuts = self.load_audio(cuts)
-        # else:
-        #     audios, audio_lens, cuts = safe_collate_audios(cuts)
-
         audios, audio_lens, cuts = self.load_audio(cuts)
 
         if audios is None:

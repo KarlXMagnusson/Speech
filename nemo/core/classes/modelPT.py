@@ -1260,7 +1260,7 @@ class ModelPT(LightningModule, Model):
 
     @rank_zero_only
     def maybe_init_from_pretrained_checkpoint(
-        self, cfg: OmegaConf, map_location: str = 'cpu', weights_only: bool = True
+        self, cfg: OmegaConf, map_location: str = 'cpu', weights_only: Optional[bool] = None
     ):
         """
         Initializes a given model with the parameters obtained via specific config arguments.

@@ -43,25 +43,6 @@ from nemo.utils import logging
 from nemo.utils.data_utils import is_datastore_path
 
 
-class LhotseLazyJsonlIterator(LazyJsonlIterator):
-    def __init__(self, path: str | Path | list[str]):
-        super().__init__(path)
-
-    def __iter__(self):
-        tot = 0
-        with open_best(self.path, "r") as f:
-            for line in f:
-                try:
-                    data = decode_json_line(line)
-                    yield data
-                    tot += 1
-                except Exception as e:
-                    logging.error(f"Error decoding JSON line `{line}` in file `{self.path}`: {e}")
-                    raise e
-        if self._len is None:
-            self._len = tot
-
-
 class LazyNeMoIterator:
     """
     ``LazyNeMoIterator`` reads a NeMo (non-tarred) JSON manifest and converts it on the fly to an ``Iterable[Cut]``.
