@@ -13,6 +13,7 @@ from nemo.lightning.speech_throughput import (
     audio_lengths,
     batch_value,
     first_positive,
+    value_count,
 )
 
 __all__ = ["AudioCodecThroughputPolicy", "TTSThroughputPolicy"]
@@ -29,6 +30,11 @@ class TTSThroughputPolicy(SpeechThroughputPolicy):
         add_audio_seconds(measurements, "output_audio_seconds", audio_lengths(batch), _sample_rate(model))
         return measurements
 
+    def num_examples(self, model: Any, batch: Any) -> int | None:
+        del model
+        lengths = _text_lengths(batch)
+        return value_count(lengths if lengths is not None else audio_lengths(batch))
+
 
 class AudioCodecThroughputPolicy(SpeechThroughputPolicy):
     """Measure input waveform duration for audio codec training."""
@@ -39,6 +45,10 @@ class AudioCodecThroughputPolicy(SpeechThroughputPolicy):
         measurements = {}
         add_audio_seconds(measurements, "input_audio_seconds", audio_lengths(batch), _sample_rate(model))
         return measurements
+
+    def num_examples(self, model: Any, batch: Any) -> int | None:
+        del model
+        return value_count(audio_lengths(batch))
 
 
 def _text_lengths(batch: Any) -> Any:

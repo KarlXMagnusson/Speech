@@ -3,6 +3,7 @@
 
 """OneLogger throughput policies for the SpeechLM2 collection."""
 
+from numbers import Integral
 from typing import Any
 
 from nemo.lightning.speech_throughput import (
@@ -13,6 +14,7 @@ from nemo.lightning.speech_throughput import (
     add_value,
     batch_value,
     first_positive,
+    value_count,
 )
 
 __all__ = [
@@ -38,6 +40,9 @@ class SALMThroughputPolicy(SpeechThroughputPolicy):
         add_value(measurements, "model_tokens", getattr(model, "_last_batch_num_tokens", None))
         return measurements
 
+    def num_examples(self, model: Any, batch: Any) -> int | None:
+        return _salm_num_examples(model, batch)
+
 
 class DuplexSTTThroughputPolicy(SpeechThroughputPolicy):
     """Measure audio and text-only work in a mixed DuplexSTT batch."""
@@ -58,6 +63,19 @@ class DuplexSTTThroughputPolicy(SpeechThroughputPolicy):
         if text_batch is not None:
             add_sum(measurements, "text_tokens", batch_value(text_batch, "text_token_lens"))
         return measurements
+
+    def num_examples(self, model: Any, batch: Any) -> int | None:
+        del model
+        counts = []
+        audio_batch = batch_value(batch, "audio_data")
+        text_batch = batch_value(batch, "text_data")
+        if audio_batch is not None:
+            counts.append(value_count(batch_value(audio_batch, "source_audio_lens")))
+        if text_batch is not None:
+            counts.append(value_count(batch_value(text_batch, "text_token_lens")))
+        if not counts or any(count is None for count in counts):
+            return None
+        return sum(counts)
 
 
 class SpeechToSpeechThroughputPolicy(SpeechThroughputPolicy):
@@ -80,6 +98,30 @@ class SpeechToSpeechThroughputPolicy(SpeechThroughputPolicy):
             _target_sample_rate(model),
         )
         return measurements
+
+    def num_examples(self, model: Any, batch: Any) -> int | None:
+        del model
+        lengths = batch_value(batch, "source_audio_lens")
+        if lengths is None:
+            lengths = batch_value(batch, "target_audio_lens")
+        return value_count(lengths)
+
+
+def _salm_num_examples(model: Any, batch: Any) -> int | None:
+    exact = getattr(model, "_last_batch_num_examples", None)
+    if isinstance(exact, Integral):
+        return int(exact)
+
+    offsets = batch_value(batch, "text_cu_seqlens")
+    count = value_count(offsets)
+    if count is not None:
+        return max(count - 1, 0)
+
+    input_ids = batch_value(batch, "input_ids")
+    shape = getattr(input_ids, "shape", None)
+    if shape is not None and len(shape) > 1:
+        return int(shape[0])
+    return None
 
 
 def _sample_rate(model: Any) -> float | None:

@@ -11,6 +11,7 @@ from nemo.lightning.speech_throughput import (
     add_audio_seconds,
     audio_lengths,
     first_positive,
+    value_count,
 )
 
 __all__ = ["AudioThroughputPolicy"]
@@ -39,3 +40,7 @@ class AudioThroughputPolicy(SpeechThroughputPolicy):
             ),
         )
         return measurements
+
+    def num_examples(self, model: Any, batch: Any) -> int | None:
+        del model
+        return value_count(audio_lengths(batch))

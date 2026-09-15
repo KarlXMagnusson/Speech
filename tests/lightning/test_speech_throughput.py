@@ -127,6 +127,7 @@ def test_asr_measures_dynamic_waveform_and_target_text_without_reducing_them():
     assert measured["target_text_tokens"].value.data_ptr() == text_lengths.data_ptr()
     assert _total(measured["input_audio_seconds"]) == 2.5
     assert _total(measured["target_text_tokens"]) == 11
+    assert ASRThroughputPolicy().num_examples(model, batch) == 2
 
 
 def test_asr_eou_batch_uses_its_named_waveform_and_text_lengths():
@@ -191,6 +192,14 @@ def test_asr_feature_tuple_omits_audio_duration_instead_of_treating_frames_as_sa
     assert measured.keys() == {"target_text_tokens"}
 
 
+@pytest.mark.parametrize("policy_type", [DiarizationThroughputPolicy, AudioThroughputPolicy])
+def test_audio_only_policies_count_dynamic_examples_from_lengths(policy_type):
+    model = SimpleNamespace(sample_rate=16000)
+    batch = {"audio_lens": torch.tensor([16000, 8000, 4000])}
+
+    assert policy_type().num_examples(model, batch) == 3
+
+
 def test_tts_measures_input_text_and_output_audio():
     model = SimpleNamespace(sample_rate=22050)
     batch = (
@@ -207,6 +216,7 @@ def test_tts_measures_input_text_and_output_audio():
 
     assert _total(measured["input_text_tokens"]) == 16
     assert _total(measured["output_audio_seconds"]) == 1.5
+    assert TTSThroughputPolicy().num_examples(model, batch) == 2
 
 
 def test_speech_to_speech_reads_distinct_real_model_rate_locations():
@@ -223,6 +233,7 @@ def test_speech_to_speech_reads_distinct_real_model_rate_locations():
 
     assert _total(measured["input_audio_seconds"]) == 1.5
     assert _total(measured["output_audio_seconds"]) == 3.0
+    assert SpeechToSpeechThroughputPolicy().num_examples(model, batch) == 2
 
 
 def test_duplex_stt_measures_nested_audio_and_text_only_sub_batches():
@@ -236,6 +247,17 @@ def test_duplex_stt_measures_nested_audio_and_text_only_sub_batches():
 
     assert _total(measured["input_audio_seconds"]) == 1.5
     assert _total(measured["text_tokens"]) == 16
+    assert DuplexSTTThroughputPolicy().num_examples(model, batch) == 5
+
+
+def test_duplex_stt_omits_example_count_when_either_active_cohort_is_unknown():
+    model = SimpleNamespace(source_sample_rate=16000)
+    batch = {
+        "audio_data": {"source_audio_lens": None},
+        "text_data": {"text_token_lens": torch.tensor([7, 5, 4])},
+    }
+
+    assert DuplexSTTThroughputPolicy().num_examples(model, batch) is None
 
 
 def test_audio_codec_uses_input_sample_rate_when_output_rate_differs():
@@ -246,6 +268,7 @@ def test_audio_codec_uses_input_sample_rate_when_output_rate_differs():
 
     assert measured.keys() == {"input_audio_seconds"}
     assert _total(measured["input_audio_seconds"]) == 1.5
+    assert AudioCodecThroughputPolicy().num_examples(model, batch) == 2
 
 
 def test_salm_uses_exact_post_insertion_tokens_for_packed_sequences_without_materializing_them():
@@ -266,16 +289,22 @@ def test_salm_uses_exact_post_insertion_tokens_for_packed_sequences_without_mate
     assert measured["model_tokens"].value.data_ptr() == model_tokens.data_ptr()
     assert _total(measured["input_audio_seconds"]) == 1.5
     assert _total(measured["model_tokens"]) == 37
+    assert SALMThroughputPolicy().num_examples(model, batch) == 2
 
 
-def test_salm_omits_model_tokens_before_the_model_has_produced_a_counter():
+def test_salm_omits_unknown_counters_instead_of_treating_flat_tokens_as_examples():
     model = SimpleNamespace(sampling_rate=16000)
-    batch = {"audio_lens": torch.empty(0, dtype=torch.long)}
+    batch = {
+        "audio_lens": torch.empty(0, dtype=torch.long),
+        "input_ids": torch.arange(12),
+    }
+    policy = SALMThroughputPolicy()
 
-    measured = SALMThroughputPolicy().measure(model, batch)
+    measured = policy.measure(model, batch)
 
     assert measured.keys() == {"input_audio_seconds"}
     assert _total(measured["input_audio_seconds"]) == 0
+    assert policy.num_examples(model, batch) is None
 
 
 def test_missing_sample_rate_omits_duration_instead_of_guessing():
@@ -287,7 +316,9 @@ def test_missing_sample_rate_omits_duration_instead_of_guessing():
     assert _total(measured["target_text_tokens"]) == 2
 
 
-def test_base_policy_never_reports_batch_size():
+def test_base_policy_omits_measurements_and_example_count():
     batch = {"audio_lens": torch.tensor([10, 20, 30])}
+    policy = SpeechThroughputPolicy()
 
-    assert SpeechThroughputPolicy().measure(object(), batch) == {}
+    assert policy.measure(object(), batch) == {}
+    assert policy.num_examples(object(), batch) is None

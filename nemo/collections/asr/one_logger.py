@@ -15,6 +15,7 @@ from nemo.lightning.speech_throughput import (
     audio_lengths,
     batch_value,
     first_positive,
+    value_count,
 )
 
 __all__ = ["ASRThroughputPolicy", "DiarizationThroughputPolicy"]
@@ -31,6 +32,11 @@ class ASRThroughputPolicy(SpeechThroughputPolicy):
         add_sum(measurements, "target_text_tokens", _text_lengths(batch))
         return measurements
 
+    def num_examples(self, model: Any, batch: Any) -> int | None:
+        del model
+        lengths = _audio_lengths(batch)
+        return value_count(lengths if lengths is not None else _text_lengths(batch))
+
 
 class DiarizationThroughputPolicy(SpeechThroughputPolicy):
     """Measure input waveform duration for diarization training."""
@@ -46,6 +52,10 @@ class DiarizationThroughputPolicy(SpeechThroughputPolicy):
             _sample_rate(model),
         )
         return measurements
+
+    def num_examples(self, model: Any, batch: Any) -> int | None:
+        del model
+        return value_count(audio_lengths(batch))
 
 
 def _audio_lengths(batch: Any) -> Any:

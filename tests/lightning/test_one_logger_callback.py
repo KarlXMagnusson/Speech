@@ -199,7 +199,7 @@ class TestOneLoggerNeMoCallback:
     def test_dynamic_asr_throughput_is_reported_over_logging_window(self, mock_event_create):
         callback, provider = _enabled_callback()
         mock_event_create.side_effect = lambda name, attributes: (name, attributes.to_json())
-        trainer = SimpleNamespace(log_every_n_steps=2, global_step=9)
+        trainer = SimpleNamespace(log_every_n_steps=2, global_step=8, accumulate_grad_batches=2)
         model = SimpleNamespace(
             one_logger_throughput_policy=ASRThroughputPolicy,
             preprocessor=SimpleNamespace(_sample_rate=16000),
@@ -222,6 +222,9 @@ class TestOneLoggerNeMoCallback:
             callback.on_train_start(trainer, model)
             for batch_idx, batch in enumerate(batches):
                 callback.on_train_batch_start(trainer, model, batch, batch_idx)
+                if batch_idx == 1:
+                    callback.on_before_optimizer_step(trainer, model, object())
+                    trainer.global_step = 9
                 callback.on_train_batch_end(trainer, model, None, batch, batch_idx)
 
         cuda_event.assert_not_called()
@@ -238,23 +241,31 @@ class TestOneLoggerNeMoCallback:
             "global_step": 9,
             "window_batches": 2,
         }
+        assert attributes["window_optimizer_steps"] == 1
+        assert attributes["examples"] == 3
+        assert attributes["mean_batch_size"] == pytest.approx(3.0)
+        assert attributes["examples_per_second"] == pytest.approx(1.5)
         assert attributes["window_seconds"] == pytest.approx(2.0)
         assert attributes["input_audio_seconds"] == pytest.approx(3.5)
         assert attributes["input_audio_seconds_per_second"] == pytest.approx(1.75)
+        assert attributes["input_audio_seconds_per_step"] == pytest.approx(3.5)
         assert attributes["target_text_tokens"] == pytest.approx(16.0)
         assert attributes["target_text_tokens_per_second"] == pytest.approx(8.0)
-        assert all("batch_size" not in name and "micro_batch" not in name for name in attributes)
+        assert attributes["target_text_tokens_per_step"] == pytest.approx(16.0)
+        assert all("micro_batch" not in name for name in attributes)
+        assert all("_per_example" not in name for name in attributes)
 
     @patch('nemo.lightning.one_logger_callback.Event.create')
     def test_salm_reports_exact_model_tokens_per_second(self, mock_event_create):
         callback, provider = _enabled_callback()
         mock_event_create.side_effect = lambda name, attributes: (name, attributes.to_json())
-        trainer = SimpleNamespace(log_every_n_steps=1, global_step=4)
+        trainer = SimpleNamespace(log_every_n_steps=1, global_step=3)
         model = SimpleNamespace(
             device=torch.device('cpu'),
             one_logger_throughput_policy=SALMThroughputPolicy,
             sampling_rate=16000,
             _last_batch_num_tokens=torch.tensor(30),
+            _last_batch_num_examples=2,
         )
         batch = {"audio_lens": torch.tensor([16000, 8000])}
 
@@ -264,6 +275,8 @@ class TestOneLoggerNeMoCallback:
         ):
             callback.on_train_start(trainer, model)
             callback.on_train_batch_start(trainer, model, batch, 0)
+            callback.on_before_optimizer_step(trainer, model, object())
+            trainer.global_step = 4
             callback.on_train_batch_end(trainer, model, None, batch, 0)
 
         attributes = provider.recorder.event.call_args.args[1][1]
@@ -271,6 +284,69 @@ class TestOneLoggerNeMoCallback:
         assert attributes["input_audio_seconds_per_second"] == pytest.approx(0.75)
         assert attributes["model_tokens"] == pytest.approx(30.0)
         assert attributes["model_tokens_per_second"] == pytest.approx(15.0)
+        assert attributes["model_tokens_per_step"] == pytest.approx(30.0)
+        assert attributes["mean_batch_size"] == pytest.approx(2.0)
+
+    @patch('nemo.lightning.one_logger_callback.Event.create')
+    def test_accumulation_window_waits_for_an_optimizer_boundary(self, mock_event_create):
+        callback, provider = _enabled_callback()
+        mock_event_create.side_effect = lambda name, attributes: (name, attributes.to_json())
+        trainer = SimpleNamespace(log_every_n_steps=2, global_step=0, accumulate_grad_batches=3)
+        model = SimpleNamespace(
+            one_logger_throughput_policy=ASRThroughputPolicy,
+            preprocessor=SimpleNamespace(_sample_rate=16000),
+        )
+        batch = (torch.zeros(1, 16000), torch.tensor([16000]), torch.zeros(1, 2), torch.tensor([2]))
+
+        with (
+            patch('nemo.lightning.one_logger_callback._get_throughput_interval', return_value=2),
+            patch('nemo.lightning.one_logger_callback.time.monotonic', side_effect=[10.0, 13.0]),
+        ):
+            callback.on_train_start(trainer, model)
+            for batch_idx in range(3):
+                callback.on_train_batch_start(trainer, model, batch, batch_idx)
+                if batch_idx == 2:
+                    callback.on_before_optimizer_step(trainer, model, object())
+                    trainer.global_step = 1
+                callback.on_train_batch_end(trainer, model, None, batch, batch_idx)
+                if batch_idx == 1:
+                    provider.recorder.event.assert_not_called()
+
+        attributes = provider.recorder.event.call_args.args[1][1]
+        assert attributes["window_batches"] == 3
+        assert attributes["window_optimizer_steps"] == 1
+        assert attributes["examples"] == 3
+        assert attributes["mean_batch_size"] == pytest.approx(3.0)
+        assert attributes["target_text_tokens_per_step"] == pytest.approx(6.0)
+
+    @patch('nemo.lightning.one_logger_callback.Event.create')
+    def test_partial_accumulation_window_omits_per_step_means(self, mock_event_create):
+        callback, provider = _enabled_callback()
+        mock_event_create.side_effect = lambda name, attributes: (name, attributes.to_json())
+        trainer = SimpleNamespace(log_every_n_steps=100, global_step=0, accumulate_grad_batches=2)
+        model = SimpleNamespace(
+            one_logger_throughput_policy=ASRThroughputPolicy,
+            preprocessor=SimpleNamespace(_sample_rate=16000),
+        )
+        batch = (torch.zeros(1, 16000), torch.tensor([16000]), torch.zeros(1, 2), torch.tensor([2]))
+
+        with patch('nemo.lightning.one_logger_callback.time.monotonic', side_effect=[10.0, 13.0]):
+            callback.on_train_start(trainer, model)
+            for batch_idx in range(3):
+                callback.on_train_batch_start(trainer, model, batch, batch_idx)
+                if batch_idx == 1:
+                    callback.on_before_optimizer_step(trainer, model, object())
+                    trainer.global_step = 1
+                callback.on_train_batch_end(trainer, model, None, batch, batch_idx)
+            callback.on_validation_start(trainer, model)
+
+        attributes = provider.recorder.event.call_args.args[1][1]
+        assert attributes["window_optimizer_steps"] == 1
+        assert attributes["examples"] == 3
+        assert attributes["examples_per_second"] == pytest.approx(1.0)
+        assert "mean_batch_size" not in attributes
+        assert "input_audio_seconds_per_step" not in attributes
+        assert "target_text_tokens_per_step" not in attributes
 
     @patch('nemo.lightning.one_logger_callback.Event.create')
     def test_cuda_window_publishes_later_without_synchronizing_training(self, mock_event_create):

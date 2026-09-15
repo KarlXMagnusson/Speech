@@ -12,6 +12,8 @@ Policy implementations must:
 
 * return additive measurements in explicit units, such as audio seconds or text
   tokens;
+* return the actual rank-local example count from ``num_examples`` when the batch
+  schema provides one without device synchronization;
 * use real per-example lengths rather than configured batch sizes or sequence
   limits;
 * omit a measurement when its unit cannot be determined safely;
@@ -28,6 +30,7 @@ semantics. Registration is inherited normally by subclasses::
         add_sum,
         batch_value,
         register_throughput_policy,
+        value_count,
     )
 
     class MyPolicy(SpeechThroughputPolicy):
@@ -38,6 +41,10 @@ semantics. Registration is inherited normally by subclasses::
             measurements = {}
             add_sum(measurements, "target_units", batch_value(batch, "target_lengths"))
             return measurements
+
+        def num_examples(self, model, batch):
+            del model
+            return value_count(batch_value(batch, "target_lengths"))
 
     @register_throughput_policy(MyPolicy)
     class MyModelBase:
@@ -71,6 +78,7 @@ __all__ = [
     "first_positive",
     "register_throughput_policy",
     "select_throughput_policy",
+    "value_count",
 ]
 
 
@@ -108,6 +116,17 @@ class SpeechThroughputPolicy:
 
         del model, batch
         return {}
+
+    def num_examples(self, model: Any, batch: Any) -> int | None:
+        """Return the number of rank-local examples in this completed training batch.
+
+        Use host-visible shape metadata only. For a batch containing disjoint
+        cohorts, return their combined count. Return None when the schema does
+        not provide a safe count.
+        """
+
+        del model, batch
+        return None
 
 
 def register_throughput_policy(policy_type: type[SpeechThroughputPolicy]):
@@ -148,6 +167,19 @@ def batch_value(batch: Any, *names: str) -> Any:
         if hasattr(batch, name):
             return getattr(batch, name)
     return None
+
+
+def value_count(value: Any) -> int | None:
+    """Return the number of entries using host-visible shape metadata only."""
+
+    if value is None or isinstance(value, (str, bytes, Mapping)):
+        return None
+    if torch.is_tensor(value):
+        return value.numel() if value.ndim > 0 else None
+    try:
+        return len(value)
+    except TypeError:
+        return None
 
 
 def audio_lengths(batch: Any) -> Any:

@@ -119,6 +119,12 @@ class OneLoggerNeMoCallback(BaseCallback):
         self._throughput_interval = 1
         self._throughput_sums = {}
         self._throughput_batches = 0
+        self._throughput_examples = 0
+        self._throughput_optimizer_steps = 0
+        self._throughput_start_global_step = None
+        self._throughput_last_global_step = None
+        self._throughput_step_aligned = False
+        self._optimizer_step_in_batch = False
         self._throughput_started_at = None
         self._throughput_cuda_start = None
         self._throughput_cuda_device = None
@@ -239,7 +245,8 @@ class OneLoggerNeMoCallback(BaseCallback):
 
     def on_train_batch_start(self, trainer: Any, pl_module: Any, batch: Any, batch_idx: int) -> None:
         """Poll completed telemetry and start a nonblocking timing window."""
-        del trainer, batch, batch_idx
+        del batch, batch_idx
+        self._optimizer_step_in_batch = False
         if self._throughput_policy is None:
             return
         self._publish_ready_throughput()
@@ -247,6 +254,9 @@ class OneLoggerNeMoCallback(BaseCallback):
             return
         if self._throughput_batches:
             return
+        global_step = int(getattr(trainer, "global_step", 0))
+        self._throughput_start_global_step = global_step
+        self._throughput_last_global_step = global_step
         self._throughput_started_at = time.monotonic()
         device = getattr(pl_module, "device", None)
         if isinstance(device, torch.device) and device.type == "cuda":
@@ -257,6 +267,14 @@ class OneLoggerNeMoCallback(BaseCallback):
                     self._throughput_cuda_start.record()
             except RuntimeError as error:
                 self._disable_throughput(error)
+
+    def on_before_optimizer_step(self, trainer: Any, pl_module: Any, optimizer: Any) -> None:
+        """Count optimizer-step boundaries so gradient accumulation is reflected."""
+
+        del trainer, pl_module, optimizer
+        if self._throughput_policy is not None and self._throughput_started_at is not None:
+            self._throughput_optimizer_steps += 1
+            self._optimizer_step_in_batch = True
 
     def on_train_batch_end(self, trainer: Any, pl_module: Any, outputs: Any, batch: Any, batch_idx: int) -> None:
         """Collect deferred work measurements for the completed training batch."""
@@ -272,8 +290,26 @@ class OneLoggerNeMoCallback(BaseCallback):
                 if not isinstance(value, ThroughputValue):
                     value = ThroughputValue(value)
                 self._throughput_sums.setdefault(name, []).append(value)
+
+            num_examples = self._throughput_policy.num_examples(pl_module, batch)
+            if num_examples is None:
+                self._throughput_examples = None
+            elif not isinstance(num_examples, int) or isinstance(num_examples, bool) or num_examples < 0:
+                raise TypeError("ThroughputPolicy.num_examples must return a non-negative int or None")
+            elif self._throughput_examples is not None:
+                self._throughput_examples += num_examples
+
+            current_global_step = int(getattr(trainer, "global_step", 0))
+            global_step_advanced = (
+                self._throughput_last_global_step is not None
+                and current_global_step > self._throughput_last_global_step
+            )
+            self._throughput_last_global_step = current_global_step
             self._throughput_batches += 1
-            if self._throughput_batches >= self._throughput_interval:
+            accumulation = int(getattr(trainer, "accumulate_grad_batches", 1) or 1)
+            optimizer_boundary = self._optimizer_step_in_batch or global_step_advanced or accumulation <= 1
+            self._throughput_step_aligned = optimizer_boundary
+            if self._throughput_batches >= self._throughput_interval and optimizer_boundary:
                 self._report_throughput(trainer=trainer)
         # Telemetry must never interrupt training, including downstream custom policies.
         except Exception as error:  # noqa: BLE001
@@ -302,21 +338,41 @@ class OneLoggerNeMoCallback(BaseCallback):
 
     def _close_throughput_window(self, trainer: Any, global_step: int | None) -> None:
         host_ended_at = time.monotonic()
+        end_global_step = int(global_step if global_step is not None else getattr(trainer, "global_step", 0))
+        observed_steps = (
+            max(end_global_step - self._throughput_start_global_step, 0)
+            if self._throughput_start_global_step is not None
+            else 0
+        )
         attributes = {
             "scope": "rank",
             "rank": _get_rank() or 0,
             "policy": self._throughput_policy.name,
-            "global_step": int(global_step if global_step is not None else getattr(trainer, "global_step", 0)),
+            "global_step": end_global_step,
             "window_batches": self._throughput_batches,
+            "window_optimizer_steps": max(self._throughput_optimizer_steps, observed_steps),
         }
+        if self._throughput_examples is not None:
+            attributes["examples"] = self._throughput_examples
         totals = _deferred_totals(self._throughput_sums)
         if self._throughput_cuda_start is None:
-            self._publish_throughput(attributes, totals, host_ended_at - self._throughput_started_at)
+            self._publish_throughput(
+                attributes,
+                totals,
+                host_ended_at - self._throughput_started_at,
+                step_aligned=self._throughput_step_aligned,
+            )
         else:
             with torch.cuda.device(self._throughput_cuda_device):
                 end = torch.cuda.Event(enable_timing=True)
                 end.record()
-            self._pending_throughput = _PendingThroughputWindow(attributes, totals, self._throughput_cuda_start, end)
+            self._pending_throughput = _PendingThroughputWindow(
+                attributes,
+                totals,
+                self._throughput_cuda_start,
+                end,
+                self._throughput_step_aligned,
+            )
         self._reset_throughput_window()
 
     def _publish_ready_throughput(self, block: bool = False) -> None:
@@ -330,19 +386,38 @@ class OneLoggerNeMoCallback(BaseCallback):
                 return
             self._pending_throughput = None
             duration = pending.start.elapsed_time(pending.end) / 1000.0
-            self._publish_throughput(pending.attributes, pending.totals, duration)
+            self._publish_throughput(
+                pending.attributes,
+                pending.totals,
+                duration,
+                step_aligned=pending.step_aligned,
+            )
         # Polling, materialization, and exporter failures must not interrupt training.
         except Exception as error:  # noqa: BLE001
             self._disable_throughput(error)
 
-    def _publish_throughput(self, attributes: dict[str, Any], totals: dict[str, Any], duration: float) -> None:
+    def _publish_throughput(
+        self,
+        attributes: dict[str, Any],
+        totals: dict[str, Any],
+        duration: float,
+        step_aligned: bool,
+    ) -> None:
         if duration <= 0:
             return
         attributes["window_seconds"] = duration
+        optimizer_steps = attributes["window_optimizer_steps"]
+        examples = attributes.get("examples")
+        if examples is not None:
+            attributes["examples_per_second"] = examples / duration
+            if step_aligned and optimizer_steps > 0:
+                attributes["mean_batch_size"] = examples / optimizer_steps
         for name, value in totals.items():
             value = value.detach().item() if torch.is_tensor(value) else float(value)
             attributes[name] = value
             attributes[f"{name}_per_second"] = value / duration
+            if step_aligned and optimizer_steps > 0:
+                attributes[f"{name}_per_step"] = value / optimizer_steps
         span = self._current_span(_SPAN_TRAINING) or self._application_span
         if span is not None:
             self._provider.recorder.event(span, Event.create(_EVENT_THROUGHPUT, Attributes(attributes)))
@@ -356,6 +431,12 @@ class OneLoggerNeMoCallback(BaseCallback):
     def _reset_throughput_window(self) -> None:
         self._throughput_sums = {}
         self._throughput_batches = 0
+        self._throughput_examples = 0
+        self._throughput_optimizer_steps = 0
+        self._throughput_start_global_step = None
+        self._throughput_last_global_step = None
+        self._throughput_step_aligned = False
+        self._optimizer_step_in_batch = False
         self._throughput_started_at = None
         self._throughput_cuda_start = None
         self._throughput_cuda_device = None
@@ -367,6 +448,7 @@ class _PendingThroughputWindow:
     totals: dict[str, Any]
     start: Any
     end: Any
+    step_aligned: bool
 
 
 def _get_throughput_interval(trainer: Any) -> int:

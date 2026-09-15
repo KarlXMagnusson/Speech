@@ -795,10 +795,9 @@ class SALMAutomodel(LightningModule, HFHubMixin):
             num_tokens = inputs["attention_mask"].long().sum()
         else:
             num_tokens = inputs["num_tokens"]
-        num_examples = inputs.get("num_examples", batch["input_ids"].shape[0])
+        text_cu_seqlens = batch.get("text_cu_seqlens")
+        num_examples = batch["input_ids"].shape[0] if text_cu_seqlens is None else text_cu_seqlens.numel() - 1
         self._last_batch_num_tokens = num_tokens.detach() if torch.is_tensor(num_tokens) else int(num_tokens)
-        if torch.is_tensor(num_examples):
-            num_examples = num_examples.detach().cpu().item()
         self._last_batch_num_examples = int(num_examples)
 
     def on_validation_epoch_start(self) -> None:
