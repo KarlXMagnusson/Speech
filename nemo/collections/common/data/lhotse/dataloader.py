@@ -18,7 +18,7 @@ import warnings
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import lhotse
 import numpy as np

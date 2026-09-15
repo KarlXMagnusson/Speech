@@ -23,9 +23,8 @@ from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import torch
-from lhotse.cut import Cut, CutSet, MixedCut, MultiCut
+from lhotse.cut import CutSet
 from lhotse.dataset import AudioSamples
-from lhotse.dataset.collation import collate_vectors
 from omegaconf import DictConfig, ListConfig, open_dict
 from torch import Tensor
 
@@ -34,7 +33,6 @@ from nemo.collections.asr.parts.preprocessing.perturb import WhiteNoisePerturbat
 from nemo.collections.asr.parts.preprocessing.segment import AudioSegment
 from nemo.collections.asr.parts.utils.manifest_utils import read_manifest
 from nemo.collections.common.data.dataset import ConcatDataset
-from nemo.collections.common.data.lhotse.audio_loading import LhotseAudioLoadingDatasetMixin
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
 from nemo.core.classes import Serialization
 from nemo.utils import logging

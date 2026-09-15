@@ -38,7 +38,7 @@ from lhotse.audio.backend import LibsndfileBackend
 from lhotse.cut import Cut
 from lhotse.dataset.dataloading import resolve_seed
 from lhotse.lazy import LazyIteratorChain, LazyJsonlIterator
-from lhotse.serialization import decode_json_line, open_best
+from lhotse.serialization import open_best
 from lhotse.utils import compute_num_samples, ifnone
 
 from nemo.collections.common.data.lhotse._compat import (
