@@ -4,7 +4,11 @@
 """OneLogger lifecycle tracing for NeMo Speech."""
 
 import os
+import time
+from dataclasses import dataclass
 from typing import Any
+
+import torch
 
 from nv_one_logger.api.config import OneLoggerConfig, OneLoggerErrorHandlingStrategy
 from nv_one_logger.core.attributes import Attributes
@@ -13,6 +17,8 @@ from nv_one_logger.training_telemetry.api.callbacks import on_app_end, on_app_st
 from nv_one_logger.training_telemetry.api.training_telemetry_provider import TrainingTelemetryProvider
 
 from nemo.lightning.base_callback import BaseCallback
+from nemo.lightning.speech_throughput import ThroughputValue, select_throughput_policy
+from nemo.utils import logging
 
 __all__ = ["OneLoggerNeMoCallback"]
 
@@ -23,6 +29,8 @@ _SPAN_CHECKPOINT_LOAD = "nemo_speech.checkpoint_load"
 _SPAN_CHECKPOINT_SAVE = "nemo_speech.checkpoint_save"
 _SPAN_TRAINING = "nemo_speech.training"
 _SPAN_VALIDATION = "nemo_speech.validation"
+_EVENT_THROUGHPUT = "nemo_speech.throughput"
+_MIN_THROUGHPUT_REPORT_INTERVAL = 100
 
 
 def _get_env_int(name: str) -> int | None:
@@ -89,13 +97,13 @@ def get_one_logger_init_config() -> dict[str, Any]:
 
 
 class OneLoggerNeMoCallback(BaseCallback):
-    """Trace NeMo Speech lifecycle without imposing an LLM workload schema.
+    """Trace NeMo Speech lifecycle and dynamic, modality-specific throughput.
 
     NeMo Speech batches may contain waveforms, frames, text, codec tokens, or a
     mixture of modalities, often with dynamic batching and gradient
-    accumulation. OneLogger's training-progress schema requires a universal
-    batch size and optionally derives token counts from one sequence length, so
-    this adapter intentionally reports lifecycle timing only.
+    accumulation. This adapter measures the actual work in each batch and keeps
+    different modalities as independent units instead of deriving them from a
+    static batch size or sequence length.
     """
 
     _instance = None
@@ -114,14 +122,29 @@ class OneLoggerNeMoCallback(BaseCallback):
         self._provider = None
         self._application_span = None
         self._active_spans = []
+        self._throughput_policy = None
+        self._throughput_interval = 1
+        self._throughput_sums = {}
+        self._throughput_batches = 0
+        self._throughput_started_at = None
+        self._throughput_cuda_start = None
+        self._throughput_cuda_device = None
+        self._pending_throughput = None
         self._initialized = True
         if not self.enabled_for_current_rank:
             return
 
-        provider = TrainingTelemetryProvider.instance()
-        provider.with_base_config(OneLoggerConfig(**init_config)).with_export_config().configure_provider()
-        self._provider = provider
-        self._application_span = on_app_start()
+        try:
+            provider = TrainingTelemetryProvider.instance()
+            provider.with_base_config(OneLoggerConfig(**init_config)).with_export_config().configure_provider()
+            self._provider = provider
+            self._application_span = on_app_start()
+        # OneLogger setup must not make model construction or training fail.
+        except Exception as error:  # noqa: BLE001
+            logging.warning("Disabling OneLogger after provider initialization failed: %s", error)
+            self.enabled_for_current_rank = False
+            self._provider = None
+            self._application_span = None
 
     def _start_span(self, name: str, attributes: Attributes | None = None) -> None:
         if self._provider is None:
@@ -146,6 +169,7 @@ class OneLoggerNeMoCallback(BaseCallback):
     def on_app_end(self) -> None:
         if self._provider is None:
             return
+        self._report_throughput(block=True)
         while self._active_spans:
             _, span = self._active_spans.pop()
             self._provider.recorder.stop(span)
@@ -176,6 +200,7 @@ class OneLoggerNeMoCallback(BaseCallback):
         self._stop_span(_SPAN_CHECKPOINT_LOAD)
 
     def on_save_checkpoint_start(self, global_step: int, async_save: bool = False) -> None:
+        self._report_throughput(global_step=global_step)
         self._start_span(
             _SPAN_CHECKPOINT_SAVE,
             Attributes({"global_step": global_step, "asynchronous": async_save}),
@@ -196,20 +221,187 @@ class OneLoggerNeMoCallback(BaseCallback):
 
     def on_save_checkpoint_end(self, global_step: int | None = None) -> None:
         del global_step
+        self._publish_ready_throughput()
         self._stop_span(_SPAN_CHECKPOINT_SAVE)
 
     def on_train_start(self, trainer: Any, pl_module: Any) -> None:
-        del trainer, pl_module
+        """Start training telemetry and select the model throughput policy."""
         self._start_span(_SPAN_TRAINING)
+        if self._provider is None:
+            return
+        try:
+            self._throughput_policy = select_throughput_policy(pl_module)
+        # Telemetry must never interrupt training, including downstream custom policies.
+        except Exception as error:  # noqa: BLE001
+            self._disable_throughput(error)
+            return
+        self._throughput_interval = _get_throughput_interval(trainer)
+        self._pending_throughput = None
+        self._reset_throughput_window()
 
     def on_train_end(self, trainer: Any, pl_module: Any) -> None:
-        del trainer, pl_module
+        del pl_module
+        self._report_throughput(trainer=trainer, block=True)
         self._stop_span(_SPAN_TRAINING)
 
+    def on_train_batch_start(self, trainer: Any, pl_module: Any, batch: Any, batch_idx: int) -> None:
+        """Poll completed telemetry and start a nonblocking timing window."""
+        del trainer, batch, batch_idx
+        if self._throughput_policy is None:
+            return
+        self._publish_ready_throughput()
+        if self._pending_throughput is not None:
+            return
+        if self._throughput_batches:
+            return
+        self._throughput_started_at = time.monotonic()
+        device = getattr(pl_module, "device", None)
+        if isinstance(device, torch.device) and device.type == "cuda":
+            try:
+                with torch.cuda.device(device):
+                    self._throughput_cuda_device = device
+                    self._throughput_cuda_start = torch.cuda.Event(enable_timing=True)
+                    self._throughput_cuda_start.record()
+            except RuntimeError as error:
+                self._disable_throughput(error)
+
+    def on_train_batch_end(self, trainer: Any, pl_module: Any, outputs: Any, batch: Any, batch_idx: int) -> None:
+        """Collect deferred work measurements for the completed training batch."""
+        del outputs, batch_idx
+        if self._throughput_policy is None or self._pending_throughput is not None:
+            return
+        try:
+            measurements = self._throughput_policy.measure(pl_module, batch)
+            if not measurements:
+                self._reset_throughput_window()
+                return
+            for name, value in measurements.items():
+                if not isinstance(value, ThroughputValue):
+                    value = ThroughputValue(value)
+                self._throughput_sums.setdefault(name, []).append(value)
+            self._throughput_batches += 1
+            if self._throughput_batches >= self._throughput_interval:
+                self._report_throughput(trainer=trainer)
+        # Telemetry must never interrupt training, including downstream custom policies.
+        except Exception as error:  # noqa: BLE001
+            self._disable_throughput(error)
+
     def on_validation_start(self, trainer: Any, pl_module: Any) -> None:
-        del trainer, pl_module
+        del pl_module
+        self._report_throughput(trainer=trainer)
         self._start_span(_SPAN_VALIDATION)
 
     def on_validation_end(self, trainer: Any, pl_module: Any) -> None:
         del trainer, pl_module
+        self._publish_ready_throughput()
         self._stop_span(_SPAN_VALIDATION)
+
+    def _report_throughput(self, trainer: Any = None, global_step: int | None = None, block: bool = False) -> None:
+        if self._provider is None:
+            return
+        try:
+            if self._throughput_batches and self._throughput_started_at is not None:
+                self._close_throughput_window(trainer, global_step)
+            self._publish_ready_throughput(block=block)
+        # OneLogger/exporter and custom-policy failures must not interrupt training.
+        except Exception as error:  # noqa: BLE001
+            self._disable_throughput(error)
+
+    def _close_throughput_window(self, trainer: Any, global_step: int | None) -> None:
+        host_ended_at = time.monotonic()
+        attributes = {
+            "scope": "rank",
+            "rank": _get_rank() or 0,
+            "policy": self._throughput_policy.name,
+            "global_step": int(global_step if global_step is not None else getattr(trainer, "global_step", 0)),
+            "window_batches": self._throughput_batches,
+        }
+        totals = _deferred_totals(self._throughput_sums)
+        if self._throughput_cuda_start is None:
+            self._publish_throughput(attributes, totals, host_ended_at - self._throughput_started_at)
+        else:
+            with torch.cuda.device(self._throughput_cuda_device):
+                end = torch.cuda.Event(enable_timing=True)
+                end.record()
+            self._pending_throughput = _PendingThroughputWindow(attributes, totals, self._throughput_cuda_start, end)
+        self._reset_throughput_window()
+
+    def _publish_ready_throughput(self, block: bool = False) -> None:
+        try:
+            pending = self._pending_throughput
+            if pending is None:
+                return
+            if block:
+                pending.end.synchronize()
+            elif not pending.end.query():
+                return
+            self._pending_throughput = None
+            duration = pending.start.elapsed_time(pending.end) / 1000.0
+            self._publish_throughput(pending.attributes, pending.totals, duration)
+        # Polling, materialization, and exporter failures must not interrupt training.
+        except Exception as error:  # noqa: BLE001
+            self._disable_throughput(error)
+
+    def _publish_throughput(self, attributes: dict[str, Any], totals: dict[str, Any], duration: float) -> None:
+        if duration <= 0:
+            return
+        attributes["window_seconds"] = duration
+        for name, value in totals.items():
+            value = value.detach().item() if torch.is_tensor(value) else float(value)
+            attributes[name] = value
+            attributes[f"{name}_per_second"] = value / duration
+        span = self._current_span(_SPAN_TRAINING) or self._application_span
+        if span is not None:
+            self._provider.recorder.event(span, Event.create(_EVENT_THROUGHPUT, Attributes(attributes)))
+
+    def _disable_throughput(self, error: Exception) -> None:
+        logging.warning("Disabling OneLogger throughput reporting after measurement failed: %s", error)
+        self._throughput_policy = None
+        self._pending_throughput = None
+        self._reset_throughput_window()
+
+    def _reset_throughput_window(self) -> None:
+        self._throughput_sums = {}
+        self._throughput_batches = 0
+        self._throughput_started_at = None
+        self._throughput_cuda_start = None
+        self._throughput_cuda_device = None
+
+
+@dataclass
+class _PendingThroughputWindow:
+    attributes: dict[str, Any]
+    totals: dict[str, Any]
+    start: Any
+    end: Any
+
+
+def _get_throughput_interval(trainer: Any) -> int:
+    configured = _get_env_int("NEMO_ONE_LOGGER_THROUGHPUT_INTERVAL")
+    if configured is not None and configured > 0:
+        return configured
+    logging_interval = int(getattr(trainer, "log_every_n_steps", 1) or 1)
+    return max(logging_interval, _MIN_THROUGHPUT_REPORT_INTERVAL)
+
+
+def _deferred_totals(measurements: dict[str, list[ThroughputValue]]) -> dict[str, Any]:
+    totals = {}
+    for name, values in measurements.items():
+        host_total = 0.0
+        tensor_groups = {}
+        for measurement in values:
+            value = measurement.value
+            if torch.is_tensor(value):
+                key = (value.device, value.dtype, measurement.scale)
+                tensor_groups.setdefault(key, []).append(value.detach().reshape(-1))
+            elif isinstance(value, (tuple, list)):
+                host_total += sum(value) * measurement.scale
+            else:
+                host_total += float(value) * measurement.scale
+        tensor_totals = [torch.cat(tensors).sum() * scale for (_, _, scale), tensors in tensor_groups.items()]
+        if tensor_totals:
+            total = sum(tensor_totals[1:], tensor_totals[0]) + host_total
+            totals[name] = total
+        else:
+            totals[name] = host_total
+    return totals

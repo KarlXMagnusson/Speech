@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
+import torch
 from lightning.pytorch.callbacks import Callback as PTLCallback
 from omegaconf import OmegaConf
 
@@ -16,9 +17,11 @@ from nemo.lightning.base_callback import BaseCallback
 from nemo.lightning.callback_group import CallbackGroup, callback_context, with_model_init_callbacks
 from nemo.lightning.one_logger_callback import (
     OneLoggerNeMoCallback,
+    _get_throughput_interval,
     _should_enable_for_current_rank,
     get_one_logger_init_config,
 )
+from nemo.lightning.speech_throughput import ASRThroughputPolicy, SpeechThroughputPolicy
 from nemo.utils.callbacks.dist_ckpt_io import AsyncFinalizableCheckpointIO
 from nemo.utils.callbacks.nemo_model_checkpoint import NeMoModelCheckpoint
 
@@ -113,6 +116,31 @@ class TestOneLoggerNeMoCallback:
         mock_config_class.assert_not_called()
         mock_app_start.assert_not_called()
 
+    @patch('nemo.lightning.one_logger_callback.on_app_start')
+    @patch('nemo.lightning.one_logger_callback.OneLoggerConfig')
+    @patch('nemo.lightning.one_logger_callback.TrainingTelemetryProvider')
+    @patch('nemo.lightning.one_logger_callback.get_one_logger_init_config')
+    def test_provider_initialization_failure_disables_callback_without_raising(
+        self, mock_get_config, mock_provider_class, mock_config_class, mock_app_start
+    ):
+        mock_get_config.return_value = {
+            "application_name": "nemo-speech",
+            "session_tag_or_fn": "test",
+            "enable_for_current_rank": True,
+            "world_size_or_fn": 1,
+        }
+        provider = mock_provider_class.instance.return_value
+        provider.with_base_config.return_value.with_export_config.return_value.configure_provider.side_effect = (
+            RuntimeError("exporter unavailable")
+        )
+
+        callback = OneLoggerNeMoCallback()
+
+        assert callback.enabled_for_current_rank is False
+        assert callback._provider is None
+        assert callback._application_span is None
+        mock_app_start.assert_not_called()
+
     def test_lifecycle_spans_are_paired_by_identity(self):
         callback, provider = _enabled_callback()
         lifecycle = (
@@ -165,17 +193,208 @@ class TestOneLoggerNeMoCallback:
         ]
         assert provider.recorder.stop.call_args_list == [call(validation_span), call(training_span)]
 
-    def test_batches_are_ignored_regardless_of_modality_or_packing(self):
+    @patch('nemo.lightning.one_logger_callback.Event.create')
+    def test_dynamic_asr_throughput_is_reported_over_logging_window(self, mock_event_create):
         callback, provider = _enabled_callback()
-        packed_batch = {"input_ids": object(), "text_cu_seqlens": object()}
+        mock_event_create.side_effect = lambda name, attributes: (name, attributes.to_json())
+        trainer = SimpleNamespace(log_every_n_steps=2, global_step=9)
+        model = SimpleNamespace(
+            one_logger_throughput_policy=ASRThroughputPolicy,
+            preprocessor=SimpleNamespace(_sample_rate=16000),
+        )
+        batches = [
+            (
+                torch.zeros(2, 32000),
+                torch.tensor([16000, 32000]),
+                torch.zeros(2, 8),
+                torch.tensor([5, 7]),
+            ),
+            (torch.zeros(1, 8000), torch.tensor([8000]), torch.zeros(1, 4), torch.tensor([4])),
+        ]
 
-        callback.on_train_batch_start(object(), object(), packed_batch, 0)
-        callback.on_train_batch_end(object(), object(), None, packed_batch, 0)
-        callback.on_validation_batch_start(object(), object(), packed_batch, 0)
-        callback.on_validation_batch_end(object(), object(), None, packed_batch, 0)
+        with (
+            patch('nemo.lightning.one_logger_callback._get_throughput_interval', return_value=2),
+            patch('nemo.lightning.one_logger_callback.time.monotonic', side_effect=[10.0, 12.0]),
+            patch('nemo.lightning.one_logger_callback.torch.cuda.Event') as cuda_event,
+        ):
+            callback.on_train_start(trainer, model)
+            for batch_idx, batch in enumerate(batches):
+                callback.on_train_batch_start(trainer, model, batch, batch_idx)
+                callback.on_train_batch_end(trainer, model, None, batch, batch_idx)
+
+        cuda_event.assert_not_called()
+
+        training_span = callback._current_span("nemo_speech.training")
+        event = provider.recorder.event.call_args_list[-1]
+        assert event.args[0] is training_span
+        assert event.args[1][0] == "nemo_speech.throughput"
+        attributes = event.args[1][1]
+        assert {key: attributes[key] for key in ("scope", "rank", "policy", "global_step", "window_batches")} == {
+            "scope": "rank",
+            "rank": 0,
+            "policy": "asr",
+            "global_step": 9,
+            "window_batches": 2,
+        }
+        assert attributes["window_seconds"] == pytest.approx(2.0)
+        assert attributes["input_audio_seconds"] == pytest.approx(3.5)
+        assert attributes["input_audio_seconds_per_second"] == pytest.approx(1.75)
+        assert attributes["target_text_tokens"] == pytest.approx(16.0)
+        assert attributes["target_text_tokens_per_second"] == pytest.approx(8.0)
+        assert all("batch_size" not in name and "micro_batch" not in name for name in attributes)
+
+    @patch('nemo.lightning.one_logger_callback.Event.create')
+    def test_cuda_window_publishes_later_without_synchronizing_training(self, mock_event_create):
+        callback, provider = _enabled_callback()
+        mock_event_create.side_effect = lambda name, attributes: (name, attributes.to_json())
+        trainer = SimpleNamespace(log_every_n_steps=1, global_step=2)
+        model = SimpleNamespace(
+            device=torch.device('cuda', 0),
+            one_logger_throughput_policy=ASRThroughputPolicy,
+            preprocessor=SimpleNamespace(_sample_rate=16000),
+        )
+        batch = (torch.zeros(1, 16000), torch.tensor([16000]), torch.zeros(1, 3), torch.tensor([3]))
+        start_event = MagicMock()
+        end_event = MagicMock()
+        next_start_event = MagicMock()
+        end_event.query.side_effect = [False, True]
+        start_event.elapsed_time.return_value = 2000.0
+
+        with (
+            patch('nemo.lightning.one_logger_callback._get_throughput_interval', return_value=1),
+            patch('nemo.lightning.one_logger_callback.time.monotonic', side_effect=[10.0, 12.0, 20.0]),
+            patch(
+                'nemo.lightning.one_logger_callback.torch.cuda.Event',
+                side_effect=[start_event, end_event, next_start_event],
+            ),
+            patch('nemo.lightning.one_logger_callback.torch.cuda.device'),
+        ):
+            callback.on_train_start(trainer, model)
+            callback.on_train_batch_start(trainer, model, batch, 0)
+            callback.on_train_batch_end(trainer, model, None, batch, 0)
+            provider.recorder.event.assert_not_called()
+            callback.on_train_batch_start(trainer, model, batch, 1)
+
+        end_event.synchronize.assert_not_called()
+        assert end_event.query.call_count == 2
+        attributes = provider.recorder.event.call_args.args[1][1]
+        assert attributes["window_seconds"] == 2.0
+        assert attributes["input_audio_seconds_per_second"] == 0.5
+        assert attributes["target_text_tokens_per_second"] == 1.5
+
+    def test_cuda_pending_window_stays_bounded_while_gpu_work_is_unresolved(self):
+        callback, provider = _enabled_callback()
+        trainer = SimpleNamespace(log_every_n_steps=1, global_step=1)
+        model = SimpleNamespace(
+            device=torch.device('cuda', 0),
+            one_logger_throughput_policy=ASRThroughputPolicy,
+            preprocessor=SimpleNamespace(_sample_rate=16000),
+        )
+        batch = (torch.zeros(1, 16000), torch.tensor([16000]), torch.zeros(1, 3), torch.tensor([3]))
+        start_event = MagicMock()
+        end_event = MagicMock()
+        end_event.query.return_value = False
+
+        with (
+            patch('nemo.lightning.one_logger_callback._get_throughput_interval', return_value=1),
+            patch('nemo.lightning.one_logger_callback.time.monotonic', side_effect=[10.0, 12.0]),
+            patch(
+                'nemo.lightning.one_logger_callback.torch.cuda.Event',
+                side_effect=[start_event, end_event],
+            ) as cuda_event,
+            patch('nemo.lightning.one_logger_callback.torch.cuda.device'),
+        ):
+            callback.on_train_start(trainer, model)
+            callback.on_train_batch_start(trainer, model, batch, 0)
+            callback.on_train_batch_end(trainer, model, None, batch, 0)
+            pending = callback._pending_throughput
+
+            for batch_idx in range(1, 5):
+                callback.on_train_batch_start(trainer, model, batch, batch_idx)
+                callback.on_train_batch_end(trainer, model, None, batch, batch_idx)
+
+        assert callback._pending_throughput is pending
+        assert callback._throughput_batches == 0
+        assert cuda_event.call_count == 2
+        assert end_event.query.call_count == 5
+        end_event.synchronize.assert_not_called()
+        provider.recorder.event.assert_not_called()
+
+    @patch('nemo.lightning.one_logger_callback.Event.create')
+    def test_lifecycle_boundaries_close_partial_windows(self, mock_event_create):
+        callback, provider = _enabled_callback()
+        mock_event_create.side_effect = lambda name, attributes: (name, attributes.to_json())
+        trainer = SimpleNamespace(log_every_n_steps=100, global_step=4)
+        model = SimpleNamespace(
+            one_logger_throughput_policy=ASRThroughputPolicy,
+            preprocessor=SimpleNamespace(_sample_rate=16000),
+        )
+        batch = (torch.zeros(1, 16000), torch.tensor([16000]), torch.zeros(1, 2), torch.tensor([2]))
+
+        with patch('nemo.lightning.one_logger_callback.time.monotonic', side_effect=[10.0, 12.0, 20.0, 22.0]):
+            callback.on_train_start(trainer, model)
+            callback.on_train_batch_start(trainer, model, batch, 0)
+            callback.on_train_batch_end(trainer, model, None, batch, 0)
+            callback.on_validation_start(trainer, model)
+            callback.on_validation_end(trainer, model)
+            callback.on_train_batch_start(trainer, model, batch, 1)
+            callback.on_train_batch_end(trainer, model, None, batch, 1)
+            callback.on_save_checkpoint_start(global_step=4)
+
+        throughput_events = [
+            event.args[1][1]
+            for event in provider.recorder.event.call_args_list
+            if event.args[1][0] == "nemo_speech.throughput"
+        ]
+        assert [event["window_seconds"] for event in throughput_events] == [2.0, 2.0]
+        assert all(event["window_batches"] == 1 for event in throughput_events)
+
+    def test_empty_measurements_do_not_emit_throughput(self):
+        callback, provider = _enabled_callback()
+        trainer = SimpleNamespace(log_every_n_steps=1, global_step=1)
+        model = SimpleNamespace(one_logger_throughput_policy=SpeechThroughputPolicy)
+        batch = {"unknown": torch.tensor([1])}
+
+        callback.on_train_start(trainer, model)
+        callback.on_train_batch_start(trainer, model, batch, 0)
+        callback.on_train_batch_end(trainer, model, None, batch, 0)
+
+        provider.recorder.event.assert_not_called()
+        assert callback._throughput_batches == 0
+
+    def test_malformed_custom_policy_never_interrupts_training(self):
+        class MalformedPolicy:
+            name = "malformed"
+
+            def measure(self, model, batch):
+                del model, batch
+                return {"invalid": object()}
+
+        callback, provider = _enabled_callback()
+        trainer = SimpleNamespace(log_every_n_steps=1, global_step=1)
+        model = SimpleNamespace(one_logger_throughput_policy=MalformedPolicy)
+        batch = {"value": torch.tensor([1])}
+
+        with (
+            patch('nemo.lightning.one_logger_callback._get_throughput_interval', return_value=1),
+            patch('nemo.lightning.one_logger_callback.time.monotonic', side_effect=[10.0, 11.0]),
+        ):
+            callback.on_train_start(trainer, model)
+            callback.on_train_batch_start(trainer, model, batch, 0)
+            callback.on_train_batch_end(trainer, model, None, batch, 0)
+
+        provider.recorder.event.assert_not_called()
+        assert callback._throughput_policy is None
+
+    def test_validation_batches_do_not_emit_throughput(self):
+        callback, provider = _enabled_callback()
+        batch = {"audio_lens": torch.tensor([10])}
+
+        callback.on_validation_batch_start(object(), object(), batch, 0)
+        callback.on_validation_batch_end(object(), object(), None, batch, 0)
 
         provider.recorder.start.assert_not_called()
-        provider.recorder.stop.assert_not_called()
+        provider.recorder.event.assert_not_called()
 
     @patch('nemo.lightning.one_logger_callback.Event.create')
     def test_checkpoint_outcomes_are_explicit_and_async_safe(self, mock_event_create):
@@ -245,6 +464,13 @@ class TestOneLoggerConfiguration:
     def test_explicit_single_process_enable(self):
         with patch.dict(os.environ, {"NEMO_ONE_LOGGER_ENABLED": "true"}, clear=True):
             assert _should_enable_for_current_rank()
+
+    def test_throughput_interval_is_low_frequency_by_default_and_configurable(self):
+        trainer = SimpleNamespace(log_every_n_steps=10)
+        with patch.dict(os.environ, {}, clear=True):
+            assert _get_throughput_interval(trainer) == 100
+        with patch.dict(os.environ, {"NEMO_ONE_LOGGER_THROUGHPUT_INTERVAL": "250"}, clear=True):
+            assert _get_throughput_interval(trainer) == 250
 
     def test_distributed_rank_selection(self):
         with patch.dict(os.environ, {"RANK": "1", "WORLD_SIZE": "4"}, clear=True):
