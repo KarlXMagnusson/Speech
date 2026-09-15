@@ -10,6 +10,14 @@ enabled.
 Enabling OneLogger
 ------------------
 
+The OneLogger Python packages are optional. NeMo Speech does not import them
+unless telemetry is explicitly enabled, and runs normally when they are not
+installed. Install the runtime packages if they are not already available:
+
+.. code-block:: bash
+
+    pip install "nv_one_logger_core>=2.3.1" "nv_one_logger_training_telemetry>=2.3.1"
+
 Set ``NEMO_ONE_LOGGER_ENABLED`` to a true value before starting a training job:
 
 .. code-block:: bash
@@ -24,7 +32,9 @@ enables the local process.
 
 Unset ``NEMO_ONE_LOGGER_ENABLED``, or set it to ``false``, to leave the
 integration disabled. OneLogger exporter destinations and credentials use the
-standard configuration supported by the installed OneLogger packages.
+standard configuration supported by the installed OneLogger packages. If
+telemetry is enabled but its packages cannot be imported, NeMo Speech logs a
+warning, disables the integration, and continues normally.
 
 Reporting cadence
 -----------------
@@ -92,7 +102,7 @@ The available work units depend on the model and batch schema:
      -
    * - SALM family
      - ``input_audio_seconds``
-     - ``model_tokens`` (text and audio tokens in the post-insertion model sequence)
+     - ``multimodal_tokens`` (text and audio tokens in the post-insertion model sequence)
    * - DuplexSTT
      - ``input_audio_seconds``
      - ``text_tokens``

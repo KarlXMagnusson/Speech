@@ -37,7 +37,7 @@ class SALMThroughputPolicy(SpeechThroughputPolicy):
             batch_value(batch, "audio_lens"),
             _sample_rate(model),
         )
-        add_value(measurements, "model_tokens", getattr(model, "_last_batch_num_tokens", None))
+        add_value(measurements, "multimodal_tokens", getattr(model, "_last_batch_num_tokens", None))
         return measurements
 
     def num_examples(self, model: Any, batch: Any) -> int | None:

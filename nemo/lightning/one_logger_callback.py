@@ -3,6 +3,9 @@
 
 """OneLogger lifecycle tracing for NeMo Speech."""
 
+from __future__ import annotations
+
+import importlib
 import os
 import time
 from dataclasses import dataclass
@@ -10,17 +13,19 @@ from typing import Any
 
 import torch
 
-from nv_one_logger.api.config import OneLoggerConfig, OneLoggerErrorHandlingStrategy
-from nv_one_logger.core.attributes import Attributes
-from nv_one_logger.core.event import Event
-from nv_one_logger.training_telemetry.api.callbacks import on_app_end, on_app_start
-from nv_one_logger.training_telemetry.api.training_telemetry_provider import TrainingTelemetryProvider
-
 from nemo.lightning.base_callback import BaseCallback
 from nemo.lightning.speech_throughput import ThroughputValue, select_throughput_policy
 from nemo.utils import logging
 
 __all__ = ["OneLoggerNeMoCallback"]
+
+OneLoggerConfig = None
+OneLoggerErrorHandlingStrategy = None
+Attributes = None
+Event = None
+on_app_end = None
+on_app_start = None
+TrainingTelemetryProvider = None
 
 _SPAN_MODEL_INIT = "nemo_speech.model_initialization"
 _SPAN_DATALOADER_INIT = "nemo_speech.data_loader_initialization"
@@ -85,7 +90,6 @@ def get_one_logger_init_config() -> dict[str, Any]:
         "session_tag_or_fn": _get_job_name(),
         "enable_for_current_rank": _should_enable_for_current_rank(),
         "world_size_or_fn": _get_world_size(),
-        "error_handling_strategy": OneLoggerErrorHandlingStrategy.DISABLE_QUIETLY_AND_REPORT_METRIC_ERROR,
     }
 
 
@@ -134,13 +138,17 @@ class OneLoggerNeMoCallback(BaseCallback):
             return
 
         try:
+            _load_one_logger()
+            init_config["error_handling_strategy"] = (
+                OneLoggerErrorHandlingStrategy.DISABLE_QUIETLY_AND_REPORT_METRIC_ERROR
+            )
             provider = TrainingTelemetryProvider.instance()
             provider.with_base_config(OneLoggerConfig(**init_config)).with_export_config().configure_provider()
             self._provider = provider
             self._application_span = on_app_start()
         # OneLogger setup must not make model construction or training fail.
         except Exception as error:  # noqa: BLE001
-            logging.warning("Disabling OneLogger after provider initialization failed: %s", error)
+            logging.warning("Disabling OneLogger after initialization failed: %s", error)
             self.enabled_for_current_rank = False
             self._provider = None
             self._application_span = None
@@ -449,6 +457,46 @@ class _PendingThroughputWindow:
     start: Any
     end: Any
     step_aligned: bool
+
+
+def _load_one_logger() -> None:
+    """Load optional OneLogger bindings only after explicit opt-in."""
+
+    global Attributes, Event, OneLoggerConfig, OneLoggerErrorHandlingStrategy
+    global TrainingTelemetryProvider, on_app_end, on_app_start
+
+    bindings = (
+        OneLoggerConfig,
+        OneLoggerErrorHandlingStrategy,
+        Attributes,
+        Event,
+        on_app_end,
+        on_app_start,
+        TrainingTelemetryProvider,
+    )
+    if all(binding is not None for binding in bindings):
+        return
+
+    config = importlib.import_module("nv_one_logger.api.config")
+    attributes = importlib.import_module("nv_one_logger.core.attributes")
+    event = importlib.import_module("nv_one_logger.core.event")
+    callbacks = importlib.import_module("nv_one_logger.training_telemetry.api.callbacks")
+    provider = importlib.import_module("nv_one_logger.training_telemetry.api.training_telemetry_provider")
+
+    if OneLoggerConfig is None:
+        OneLoggerConfig = config.OneLoggerConfig
+    if OneLoggerErrorHandlingStrategy is None:
+        OneLoggerErrorHandlingStrategy = config.OneLoggerErrorHandlingStrategy
+    if Attributes is None:
+        Attributes = attributes.Attributes
+    if Event is None:
+        Event = event.Event
+    if on_app_end is None:
+        on_app_end = callbacks.on_app_end
+    if on_app_start is None:
+        on_app_start = callbacks.on_app_start
+    if TrainingTelemetryProvider is None:
+        TrainingTelemetryProvider = provider.TrainingTelemetryProvider
 
 
 def _get_throughput_interval(trainer: Any) -> int:

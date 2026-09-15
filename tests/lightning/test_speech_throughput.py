@@ -272,8 +272,8 @@ def test_audio_codec_uses_input_sample_rate_when_output_rate_differs():
 
 
 def test_salm_uses_exact_post_insertion_tokens_for_packed_sequences_without_materializing_them():
-    model_tokens = torch.tensor(37)
-    model = SimpleNamespace(sampling_rate=16000, _last_batch_num_tokens=model_tokens)
+    multimodal_tokens = torch.tensor(37)
+    model = SimpleNamespace(sampling_rate=16000, _last_batch_num_tokens=multimodal_tokens)
     audio_lengths = torch.tensor([16000, 8000])
     batch = {
         "packed_audio_samples": torch.zeros(24000),
@@ -284,11 +284,11 @@ def test_salm_uses_exact_post_insertion_tokens_for_packed_sequences_without_mate
 
     measured = SALMThroughputPolicy().measure(model, batch)
 
-    assert measured.keys() == {"input_audio_seconds", "model_tokens"}
+    assert measured.keys() == {"input_audio_seconds", "multimodal_tokens"}
     assert measured["input_audio_seconds"].value.data_ptr() == audio_lengths.data_ptr()
-    assert measured["model_tokens"].value.data_ptr() == model_tokens.data_ptr()
+    assert measured["multimodal_tokens"].value.data_ptr() == multimodal_tokens.data_ptr()
     assert _total(measured["input_audio_seconds"]) == 1.5
-    assert _total(measured["model_tokens"]) == 37
+    assert _total(measured["multimodal_tokens"]) == 37
     assert SALMThroughputPolicy().num_examples(model, batch) == 2
 
 

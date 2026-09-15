@@ -4,6 +4,7 @@
 """Unit tests for NeMo Speech OneLogger lifecycle tracing."""
 
 import os
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -12,6 +13,7 @@ import torch
 from lightning.pytorch.callbacks import Callback as PTLCallback
 from omegaconf import OmegaConf
 
+import nemo.lightning.one_logger_callback as one_logger_module
 from nemo.collections.asr.one_logger import ASRThroughputPolicy
 from nemo.collections.speechlm2.one_logger import SALMThroughputPolicy
 from nemo.core.classes.modelPT import ModelPT
@@ -38,6 +40,8 @@ def reset_one_logger_callback_singleton():
 
 def _enabled_callback():
     provider = MagicMock()
+    provider_class = MagicMock()
+    provider_class.instance.return_value = provider
     provider.recorder.start.side_effect = lambda name, **kwargs: SimpleNamespace(name=name, attributes=kwargs)
     init_config = {
         "application_name": "nemo-speech",
@@ -45,20 +49,19 @@ def _enabled_callback():
         "enable_for_current_rank": True,
         "world_size_or_fn": 1,
     }
-    patches = (
-        patch('nemo.lightning.one_logger_callback.get_one_logger_init_config', return_value=init_config),
-        patch('nemo.lightning.one_logger_callback.TrainingTelemetryProvider.instance', return_value=provider),
-        patch('nemo.lightning.one_logger_callback.OneLoggerConfig'),
-        patch(
-            'nemo.lightning.one_logger_callback.on_app_start',
-            return_value=SimpleNamespace(name='application'),
-        ),
-    )
-    for active_patch in patches:
-        active_patch.start()
-    callback = OneLoggerNeMoCallback()
-    for active_patch in reversed(patches):
-        active_patch.stop()
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch('nemo.lightning.one_logger_callback.get_one_logger_init_config', return_value=init_config)
+        )
+        stack.enter_context(patch('nemo.lightning.one_logger_callback.TrainingTelemetryProvider', provider_class))
+        stack.enter_context(patch('nemo.lightning.one_logger_callback.OneLoggerConfig'))
+        stack.enter_context(
+            patch(
+                'nemo.lightning.one_logger_callback.on_app_start',
+                return_value=SimpleNamespace(name='application'),
+            )
+        )
+        callback = OneLoggerNeMoCallback()
     return callback, provider
 
 
@@ -256,7 +259,7 @@ class TestOneLoggerNeMoCallback:
         assert all("_per_example" not in name for name in attributes)
 
     @patch('nemo.lightning.one_logger_callback.Event.create')
-    def test_salm_reports_exact_model_tokens_per_second(self, mock_event_create):
+    def test_salm_reports_exact_multimodal_tokens_per_second(self, mock_event_create):
         callback, provider = _enabled_callback()
         mock_event_create.side_effect = lambda name, attributes: (name, attributes.to_json())
         trainer = SimpleNamespace(log_every_n_steps=1, global_step=3)
@@ -282,9 +285,9 @@ class TestOneLoggerNeMoCallback:
         attributes = provider.recorder.event.call_args.args[1][1]
         assert attributes["policy"] == "salm"
         assert attributes["input_audio_seconds_per_second"] == pytest.approx(0.75)
-        assert attributes["model_tokens"] == pytest.approx(30.0)
-        assert attributes["model_tokens_per_second"] == pytest.approx(15.0)
-        assert attributes["model_tokens_per_step"] == pytest.approx(30.0)
+        assert attributes["multimodal_tokens"] == pytest.approx(30.0)
+        assert attributes["multimodal_tokens_per_second"] == pytest.approx(15.0)
+        assert attributes["multimodal_tokens_per_step"] == pytest.approx(30.0)
         assert attributes["mean_batch_size"] == pytest.approx(2.0)
 
     @patch('nemo.lightning.one_logger_callback.Event.create')
@@ -550,6 +553,36 @@ class TestOneLoggerNeMoCallback:
 
 
 class TestOneLoggerConfiguration:
+    def test_disabled_mode_does_not_import_onelogger(self):
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("nemo.lightning.one_logger_callback.importlib.import_module") as import_module,
+        ):
+            group = CallbackGroup()
+
+        import_module.assert_not_called()
+        assert group.callbacks == []
+
+    def test_missing_optional_dependency_is_a_noop(self):
+        missing = ModuleNotFoundError("No module named nv_one_logger", name="nv_one_logger")
+        with (
+            patch.dict(os.environ, {"NEMO_ONE_LOGGER_ENABLED": "true"}, clear=True),
+            patch.multiple(
+                one_logger_module,
+                OneLoggerConfig=None,
+                OneLoggerErrorHandlingStrategy=None,
+                Attributes=None,
+                Event=None,
+                on_app_end=None,
+                on_app_start=None,
+                TrainingTelemetryProvider=None,
+            ),
+            patch("nemo.lightning.one_logger_callback.importlib.import_module", side_effect=missing),
+        ):
+            group = CallbackGroup()
+
+        assert group.callbacks == []
+
     def test_init_config_is_modality_independent(self):
         with patch.dict(
             os.environ,
