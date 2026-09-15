@@ -1,4 +1,5 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,6 +34,7 @@ from nemo.collections.asr.parts.preprocessing.perturb import WhiteNoisePerturbat
 from nemo.collections.asr.parts.preprocessing.segment import AudioSegment
 from nemo.collections.asr.parts.utils.manifest_utils import read_manifest
 from nemo.collections.common.data.dataset import ConcatDataset
+from nemo.collections.common.data.lhotse.audio_loading import LhotseAudioLoadingDatasetMixin
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
 from nemo.core.classes import Serialization
 from nemo.utils import logging
