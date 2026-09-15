@@ -5,9 +5,7 @@ import importlib.util
 from pathlib import Path
 
 
-_TIMESTAMP_SCRIPT = (
-    Path(__file__).resolve().parents[3] / "examples" / "asr" / "extract_pee_transformer_ctc_timestamps.py"
-)
+_TIMESTAMP_SCRIPT = Path(__file__).resolve().parents[3] / "examples" / "asr" / "extract_salm_enc_ctc_timestamps.py"
 _SPEC = importlib.util.spec_from_file_location("pee_transformer_ctc_timestamp_cli", _TIMESTAMP_SCRIPT)
 assert _SPEC is not None and _SPEC.loader is not None
 timestamp_cli = importlib.util.module_from_spec(_SPEC)
