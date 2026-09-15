@@ -39,6 +39,7 @@ from transformers import GenerationConfig
 from nemo.collections.common.prompts import PromptFormatter
 from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.speechlm2.data.salm_dataset import left_collate_vectors
+from nemo.collections.speechlm2.one_logger import SALMSequenceThroughputPolicy
 from nemo.collections.speechlm2.parts.encoder_chunking import encode_audio_with_optional_chunking
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.input_utils import _unpad_inputs
@@ -52,9 +53,11 @@ from nemo.collections.speechlm2.parts.pretrained import (
 )
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, MaskType, NeuralType
 from nemo.lightning.callback_group import with_model_init_callbacks
+from nemo.lightning.speech_throughput import register_throughput_policy
 from nemo.utils import logging
 
 
+@register_throughput_policy(SALMSequenceThroughputPolicy)
 @with_model_init_callbacks
 class SALM(LightningModule, HFHubMixin):
     def __init__(self, cfg) -> None:

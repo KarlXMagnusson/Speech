@@ -69,20 +69,13 @@ def _get_rank() -> int | None:
     return rank
 
 
-def _is_explicitly_disabled() -> bool:
-    enabled = os.environ.get("NEMO_ONE_LOGGER_ENABLED")
-    return enabled is not None and enabled.lower() in {"0", "false", "no", "off"}
-
-
 def _should_enable_for_current_rank() -> bool:
-    """Export on rank zero; require explicit opt-in when no launcher rank exists."""
-    if _is_explicitly_disabled():
+    """Enable only after explicit opt-in, and export from rank zero."""
+    enabled = os.environ.get("NEMO_ONE_LOGGER_ENABLED")
+    if enabled is None or enabled.lower() not in {"1", "true", "yes", "on"}:
         return False
     rank = _get_rank()
-    if rank is not None:
-        return rank == 0
-    enabled = os.environ.get("NEMO_ONE_LOGGER_ENABLED")
-    return enabled is not None and enabled.lower() in {"1", "true", "yes", "on"}
+    return rank in (None, 0)
 
 
 def get_one_logger_init_config() -> dict[str, Any]:

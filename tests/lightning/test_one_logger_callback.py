@@ -12,6 +12,7 @@ import torch
 from lightning.pytorch.callbacks import Callback as PTLCallback
 from omegaconf import OmegaConf
 
+from nemo.collections.asr.one_logger import ASRThroughputPolicy
 from nemo.core.classes.modelPT import ModelPT
 from nemo.lightning.base_callback import BaseCallback
 from nemo.lightning.callback_group import CallbackGroup, callback_context, with_model_init_callbacks
@@ -21,7 +22,7 @@ from nemo.lightning.one_logger_callback import (
     _should_enable_for_current_rank,
     get_one_logger_init_config,
 )
-from nemo.lightning.speech_throughput import ASRThroughputPolicy, SpeechThroughputPolicy
+from nemo.lightning.speech_throughput import SpeechThroughputPolicy
 from nemo.utils.callbacks.dist_ckpt_io import AsyncFinalizableCheckpointIO
 from nemo.utils.callbacks.nemo_model_checkpoint import NeMoModelCheckpoint
 
@@ -446,7 +447,16 @@ class TestOneLoggerNeMoCallback:
 
 class TestOneLoggerConfiguration:
     def test_init_config_is_modality_independent(self):
-        with patch.dict(os.environ, {"SLURM_JOB_NAME": "speech-job", "WORLD_SIZE": "4", "RANK": "0"}, clear=True):
+        with patch.dict(
+            os.environ,
+            {
+                "NEMO_ONE_LOGGER_ENABLED": "true",
+                "SLURM_JOB_NAME": "speech-job",
+                "WORLD_SIZE": "4",
+                "RANK": "0",
+            },
+            clear=True,
+        ):
             config = get_one_logger_init_config()
 
         assert config["application_name"] == "nemo-speech"
@@ -456,9 +466,12 @@ class TestOneLoggerConfiguration:
         assert "telemetry_config" not in config
         assert all("batch" not in key and "sequence" not in key and "token" not in key for key in config)
 
-    @pytest.mark.parametrize("value", ["0", "false", "no", "off"])
-    def test_explicit_disable(self, value):
-        with patch.dict(os.environ, {"NEMO_ONE_LOGGER_ENABLED": value, "RANK": "0"}, clear=True):
+    @pytest.mark.parametrize("value", [None, "0", "false", "no", "off", "invalid"])
+    def test_disabled_without_explicit_opt_in(self, value):
+        environment = {"RANK": "0"}
+        if value is not None:
+            environment["NEMO_ONE_LOGGER_ENABLED"] = value
+        with patch.dict(os.environ, environment, clear=True):
             assert not _should_enable_for_current_rank()
 
     def test_explicit_single_process_enable(self):
@@ -473,9 +486,17 @@ class TestOneLoggerConfiguration:
             assert _get_throughput_interval(trainer) == 250
 
     def test_distributed_rank_selection(self):
-        with patch.dict(os.environ, {"RANK": "1", "WORLD_SIZE": "4"}, clear=True):
+        with patch.dict(
+            os.environ,
+            {"NEMO_ONE_LOGGER_ENABLED": "true", "RANK": "1", "WORLD_SIZE": "4"},
+            clear=True,
+        ):
             assert not _should_enable_for_current_rank()
-        with patch.dict(os.environ, {"RANK": "0", "WORLD_SIZE": "4"}, clear=True):
+        with patch.dict(
+            os.environ,
+            {"NEMO_ONE_LOGGER_ENABLED": "true", "RANK": "0", "WORLD_SIZE": "4"},
+            clear=True,
+        ):
             assert _should_enable_for_current_rank()
 
 

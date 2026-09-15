@@ -6,18 +6,19 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from nemo.lightning.speech_throughput import (
-    ASRThroughputPolicy,
-    AudioCodecThroughputPolicy,
-    AudioThroughputPolicy,
-    DiarizationThroughputPolicy,
+from nemo.collections.asr.one_logger import ASRThroughputPolicy, DiarizationThroughputPolicy
+from nemo.collections.audio.one_logger import AudioThroughputPolicy
+from nemo.collections.speechlm2.one_logger import (
     DuplexSTTThroughputPolicy,
     SALMAutomodelThroughputPolicy,
     SALMSequenceThroughputPolicy,
     SALMThroughputPolicy,
-    SpeechThroughputPolicy,
     SpeechToSpeechThroughputPolicy,
-    TTSThroughputPolicy,
+)
+from nemo.collections.tts.one_logger import AudioCodecThroughputPolicy, TTSThroughputPolicy
+from nemo.lightning.speech_throughput import (
+    SpeechThroughputPolicy,
+    register_throughput_policy,
     select_throughput_policy,
 )
 
@@ -40,76 +41,79 @@ def _total(measurement):
 
 
 @pytest.mark.parametrize(
-    ("model", "policy_type"),
+    "policy_type",
     [
-        (
-            _model("nemo.collections.speechlm2.models.salm_automodel", "SALMAutomodel"),
-            SALMAutomodelThroughputPolicy,
-        ),
-        (
-            _model("nemo.collections.speechlm2.models.salm", "SALM"),
-            SALMSequenceThroughputPolicy,
-        ),
-        (
-            _model("nemo.collections.speechlm2.models.salm_asr_decoder", "SALMWithAsrDecoder"),
-            SALMThroughputPolicy,
-        ),
-        (
-            _model("nemo.collections.speechlm2.models.duplex_stt_model", "DuplexSTTModel"),
-            DuplexSTTThroughputPolicy,
-        ),
-        (
-            _model("nemo.collections.speechlm2.models.duplex_s2s_model", "DuplexS2SModel"),
-            SpeechToSpeechThroughputPolicy,
-        ),
-        (
-            _model("nemo.collections.asr.models.ctc_models", "EncDecCTCModel"),
-            ASRThroughputPolicy,
-        ),
-        (
-            _model("nemo.collections.asr.models.sortformer_diar_models", "SortformerEncLabelModel"),
-            DiarizationThroughputPolicy,
-        ),
-        (
-            _model("nemo.collections.tts.models.fastpitch", "FastPitchModel"),
-            TTSThroughputPolicy,
-        ),
-        (
-            _model("nemo.collections.tts.models.audio_codec", "AudioCodecModel"),
-            AudioCodecThroughputPolicy,
-        ),
-        (
-            _model("nemo.collections.audio.models.enhancement", "EncMaskDecAudioToAudioModel"),
-            AudioThroughputPolicy,
-        ),
+        ASRThroughputPolicy,
+        DiarizationThroughputPolicy,
+        AudioThroughputPolicy,
+        TTSThroughputPolicy,
+        AudioCodecThroughputPolicy,
+        SALMThroughputPolicy,
+        SALMSequenceThroughputPolicy,
+        SALMAutomodelThroughputPolicy,
+        DuplexSTTThroughputPolicy,
+        SpeechToSpeechThroughputPolicy,
     ],
 )
-def test_selects_known_policy_without_importing_models(model, policy_type):
-    assert isinstance(select_throughput_policy(model), policy_type)
+def test_registered_policy_is_selected_through_inheritance(policy_type):
+    @register_throughput_policy(policy_type)
+    class ModelBase:
+        pass
+
+    class Model(ModelBase):
+        pass
+
+    assert isinstance(select_throughput_policy(Model()), policy_type)
 
 
-@pytest.mark.parametrize(
-    "model",
-    [
-        object(),
-        _model("nemo.collections.asr.models.classification_models", "EncDecClassificationModel"),
-        _model("nemo.collections.asr.models.ssl_models", "SpeechEncDecSelfSupervisedModel"),
-        _model("nemo.collections.tts.models.base", "G2PModel"),
-        _model("nemo.collections.speechlm2.models.unknown", "FutureSpeechModel"),
-    ],
-)
-def test_unknown_or_semantically_ambiguous_model_is_not_reported(model):
-    assert select_throughput_policy(model) is None
+def test_specialized_subclass_can_override_inherited_policy():
+    @register_throughput_policy(ASRThroughputPolicy)
+    class ModelBase:
+        pass
+
+    @register_throughput_policy(TTSThroughputPolicy)
+    class Model(ModelBase):
+        pass
+
+    assert isinstance(select_throughput_policy(Model()), TTSThroughputPolicy)
 
 
-def test_explicit_policy_overrides_default_dispatch():
-    model = _model(
-        "downstream.models",
-        "CustomModel",
-        one_logger_throughput_policy=ASRThroughputPolicy,
-    )
+def test_unregistered_model_is_not_reported():
+    assert select_throughput_policy(object()) is None
 
-    assert isinstance(select_throughput_policy(model), ASRThroughputPolicy)
+
+def test_explicit_policy_instance_is_supported_for_downstream_models():
+    policy = ASRThroughputPolicy()
+    model = _model("downstream.models", "CustomModel", one_logger_throughput_policy=policy)
+
+    assert select_throughput_policy(model) is policy
+
+
+def test_collection_trunks_register_representative_model_policies():
+    from nemo.collections.asr.parts.mixins.diarization import SpkDiarizationMixin
+    from nemo.collections.asr.parts.mixins.transcription import ASRTranscriptionMixin
+    from nemo.collections.audio.models.audio_to_audio import AudioToAudioModel
+    from nemo.collections.speechlm2.models.duplex_s2s_model import DuplexS2SModel
+    from nemo.collections.speechlm2.models.duplex_stt_model import DuplexSTTModel
+    from nemo.collections.speechlm2.models.salm import SALM
+    from nemo.collections.speechlm2.models.salm_automodel import SALMAutomodel
+    from nemo.collections.tts.models.audio_codec import AudioCodecModel
+    from nemo.collections.tts.models.fastpitch import FastPitchModel
+
+    registrations = {
+        ASRTranscriptionMixin: ASRThroughputPolicy,
+        SpkDiarizationMixin: DiarizationThroughputPolicy,
+        AudioToAudioModel: AudioThroughputPolicy,
+        FastPitchModel: TTSThroughputPolicy,
+        AudioCodecModel: AudioCodecThroughputPolicy,
+        SALM: SALMSequenceThroughputPolicy,
+        SALMAutomodel: SALMAutomodelThroughputPolicy,
+        DuplexSTTModel: DuplexSTTThroughputPolicy,
+        DuplexS2SModel: SpeechToSpeechThroughputPolicy,
+    }
+
+    for model_type, policy_type in registrations.items():
+        assert model_type.one_logger_throughput_policy is policy_type
 
 
 def test_asr_measures_dynamic_waveform_and_target_text_without_reducing_them():
