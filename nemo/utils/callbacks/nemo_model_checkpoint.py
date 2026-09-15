@@ -45,7 +45,6 @@ class NeMoModelCheckpoint(ModelCheckpoint):
     """
 
     UNFINISHED_CHECKPOINT_SUFFIX = "-unfinished"
-    _nemo_one_logger_instrumented = True
 
     def __init__(
         self,
@@ -544,9 +543,12 @@ class NeMoModelCheckpoint(ModelCheckpoint):
 
     def _save_checkpoint(self, trainer: 'lightning.pytorch.Trainer', filepath: str) -> None:  # noqa: F821
         group = CallbackGroup.get_instance()
-        group.on_save_checkpoint_start(trainer.global_step)
+        group.on_save_checkpoint_start(trainer.global_step, async_save=self.async_save)
         try:
             self._save_checkpoint_with_lifecycle(trainer, filepath)
+        except Exception:
+            group.on_save_checkpoint_failure(trainer.global_step)
+            raise
         finally:
             group.on_save_checkpoint_end()
 

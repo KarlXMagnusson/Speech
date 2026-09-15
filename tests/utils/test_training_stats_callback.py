@@ -67,15 +67,11 @@ def test_training_stats_callback_reduces_with_device_mesh_dp_group(monkeypatch):
 
     monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
 
-    batch = {}
-    module._one_logger_batch_token = 7
-    callback.on_train_batch_end(SimpleNamespace(), module, outputs=None, batch=batch, batch_idx=0)
+    callback.on_train_batch_end(SimpleNamespace(), module, outputs=None, batch={}, batch_idx=0)
 
     assert seen == [dp_group]
     assert callback.num_tokens_total == 5
     assert callback.num_examples_total == 2
-    assert module._last_batch_global_num_examples == 2
-    assert module._last_batch_stats_batch_token == 7
     assert module.logged["num_tokens_total"] == 5.0
     assert module.logged["num_examples_total"] == 2.0
 

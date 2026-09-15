@@ -62,11 +62,6 @@ class CallbackGroup:
         """Return whether a callback should emit lifecycle events in this process."""
         return bool(getattr(callback, 'enabled_for_current_rank', True))
 
-    @classmethod
-    def _should_attach(cls, callback: BaseCallback) -> bool:
-        """Attach callbacks that emit locally or must join distributed collectives."""
-        return cls._is_enabled(callback) or bool(getattr(callback, 'participates_on_all_ranks', False))
-
     def update_config(self, nemo_version: str, trainer: Any, **kwargs) -> None:
         """Update configuration across all registered callbacks and attach them to trainer.
 
@@ -79,7 +74,7 @@ class CallbackGroup:
         sanitized_group_callbacks: List[BaseCallback] = []
         for cb in self._callbacks:
             # Will ignore other callbacks like unittest.mock.MagicMock
-            if not isinstance(cb, BaseCallback) or not self._should_attach(cb):
+            if not isinstance(cb, BaseCallback) or not self._is_enabled(cb):
                 continue
             if hasattr(cb, 'update_config'):
                 method = getattr(cb, 'update_config')
@@ -92,7 +87,7 @@ class CallbackGroup:
     def attach_to_trainer(self, trainer: Any, callbacks: Optional[List[BaseCallback]] = None) -> None:
         """Attach registered Lightning callbacks once, preserving existing callback order."""
         callbacks = callbacks if callbacks is not None else self._callbacks
-        callbacks = [cb for cb in callbacks if self._should_attach(cb)]
+        callbacks = [cb for cb in callbacks if self._is_enabled(cb)]
         existing = [cb for cb in getattr(trainer, 'callbacks', []) if isinstance(cb, PTLCallback)]
         callback_types = {type(cb) for cb in existing}
         callbacks = existing + [
