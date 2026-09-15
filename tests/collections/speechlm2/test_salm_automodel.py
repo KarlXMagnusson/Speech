@@ -395,7 +395,8 @@ def test_salm_automodel_record_training_stats_uses_thd_metadata():
 
     model._record_training_stats(batch, inputs)
 
-    assert model._last_batch_num_tokens == 11
+    assert torch.equal(model._last_batch_num_tokens, torch.tensor(11))
+    assert model._last_batch_num_tokens.data_ptr() == inputs["num_tokens"].data_ptr()
     assert model._last_batch_num_examples == 3
 
 

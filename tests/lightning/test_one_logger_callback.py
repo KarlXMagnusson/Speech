@@ -13,6 +13,7 @@ from lightning.pytorch.callbacks import Callback as PTLCallback
 from omegaconf import OmegaConf
 
 from nemo.collections.asr.one_logger import ASRThroughputPolicy
+from nemo.collections.speechlm2.one_logger import SALMThroughputPolicy
 from nemo.core.classes.modelPT import ModelPT
 from nemo.lightning.base_callback import BaseCallback
 from nemo.lightning.callback_group import CallbackGroup, callback_context, with_model_init_callbacks
@@ -243,6 +244,33 @@ class TestOneLoggerNeMoCallback:
         assert attributes["target_text_tokens"] == pytest.approx(16.0)
         assert attributes["target_text_tokens_per_second"] == pytest.approx(8.0)
         assert all("batch_size" not in name and "micro_batch" not in name for name in attributes)
+
+    @patch('nemo.lightning.one_logger_callback.Event.create')
+    def test_salm_reports_exact_model_tokens_per_second(self, mock_event_create):
+        callback, provider = _enabled_callback()
+        mock_event_create.side_effect = lambda name, attributes: (name, attributes.to_json())
+        trainer = SimpleNamespace(log_every_n_steps=1, global_step=4)
+        model = SimpleNamespace(
+            device=torch.device('cpu'),
+            one_logger_throughput_policy=SALMThroughputPolicy,
+            sampling_rate=16000,
+            _last_batch_num_tokens=torch.tensor(30),
+        )
+        batch = {"audio_lens": torch.tensor([16000, 8000])}
+
+        with (
+            patch('nemo.lightning.one_logger_callback._get_throughput_interval', return_value=1),
+            patch('nemo.lightning.one_logger_callback.time.monotonic', side_effect=[10.0, 12.0]),
+        ):
+            callback.on_train_start(trainer, model)
+            callback.on_train_batch_start(trainer, model, batch, 0)
+            callback.on_train_batch_end(trainer, model, None, batch, 0)
+
+        attributes = provider.recorder.event.call_args.args[1][1]
+        assert attributes["policy"] == "salm"
+        assert attributes["input_audio_seconds_per_second"] == pytest.approx(0.75)
+        assert attributes["model_tokens"] == pytest.approx(30.0)
+        assert attributes["model_tokens_per_second"] == pytest.approx(15.0)
 
     @patch('nemo.lightning.one_logger_callback.Event.create')
     def test_cuda_window_publishes_later_without_synchronizing_training(self, mock_event_create):

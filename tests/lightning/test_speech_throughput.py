@@ -10,8 +10,6 @@ from nemo.collections.asr.one_logger import ASRThroughputPolicy, DiarizationThro
 from nemo.collections.audio.one_logger import AudioThroughputPolicy
 from nemo.collections.speechlm2.one_logger import (
     DuplexSTTThroughputPolicy,
-    SALMAutomodelThroughputPolicy,
-    SALMSequenceThroughputPolicy,
     SALMThroughputPolicy,
     SpeechToSpeechThroughputPolicy,
 )
@@ -49,8 +47,6 @@ def _total(measurement):
         TTSThroughputPolicy,
         AudioCodecThroughputPolicy,
         SALMThroughputPolicy,
-        SALMSequenceThroughputPolicy,
-        SALMAutomodelThroughputPolicy,
         DuplexSTTThroughputPolicy,
         SpeechToSpeechThroughputPolicy,
     ],
@@ -96,6 +92,7 @@ def test_collection_trunks_register_representative_model_policies():
     from nemo.collections.speechlm2.models.duplex_s2s_model import DuplexS2SModel
     from nemo.collections.speechlm2.models.duplex_stt_model import DuplexSTTModel
     from nemo.collections.speechlm2.models.salm import SALM
+    from nemo.collections.speechlm2.models.salm_asr_decoder import SALMWithAsrDecoder
     from nemo.collections.speechlm2.models.salm_automodel import SALMAutomodel
     from nemo.collections.tts.models.audio_codec import AudioCodecModel
     from nemo.collections.tts.models.fastpitch import FastPitchModel
@@ -106,8 +103,9 @@ def test_collection_trunks_register_representative_model_policies():
         AudioToAudioModel: AudioThroughputPolicy,
         FastPitchModel: TTSThroughputPolicy,
         AudioCodecModel: AudioCodecThroughputPolicy,
-        SALM: SALMSequenceThroughputPolicy,
-        SALMAutomodel: SALMAutomodelThroughputPolicy,
+        SALM: SALMThroughputPolicy,
+        SALMWithAsrDecoder: SALMThroughputPolicy,
+        SALMAutomodel: SALMThroughputPolicy,
         DuplexSTTModel: DuplexSTTThroughputPolicy,
         DuplexS2SModel: SpeechToSpeechThroughputPolicy,
     }
@@ -250,8 +248,9 @@ def test_audio_codec_uses_input_sample_rate_when_output_rate_differs():
     assert _total(measured["input_audio_seconds"]) == 1.5
 
 
-def test_salm_automodel_uses_exact_mixed_modality_positions_for_packed_sequences():
-    model = SimpleNamespace(sampling_rate=16000, _last_batch_num_tokens=37)
+def test_salm_uses_exact_post_insertion_tokens_for_packed_sequences_without_materializing_them():
+    model_tokens = torch.tensor(37)
+    model = SimpleNamespace(sampling_rate=16000, _last_batch_num_tokens=model_tokens)
     audio_lengths = torch.tensor([16000, 8000])
     batch = {
         "packed_audio_samples": torch.zeros(24000),
@@ -260,21 +259,18 @@ def test_salm_automodel_uses_exact_mixed_modality_positions_for_packed_sequences
         "text_cu_seqlens": torch.tensor([0, 5, 12]),
     }
 
-    measured = SALMAutomodelThroughputPolicy().measure(model, batch)
+    measured = SALMThroughputPolicy().measure(model, batch)
 
-    assert measured.keys() == {"input_audio_seconds", "model_sequence_positions"}
+    assert measured.keys() == {"input_audio_seconds", "model_tokens"}
     assert measured["input_audio_seconds"].value.data_ptr() == audio_lengths.data_ptr()
+    assert measured["model_tokens"].value.data_ptr() == model_tokens.data_ptr()
     assert _total(measured["input_audio_seconds"]) == 1.5
-    assert _total(measured["model_sequence_positions"]) == 37
+    assert _total(measured["model_tokens"]) == 37
 
 
-def test_salm_variants_without_mixed_position_counter_keep_stable_audio_schema():
-    model = SimpleNamespace(sampling_rate=16000, text_pad_id=0, audio_locator_tag_id=99)
-    batch = {
-        "audio_lens": torch.empty(0, dtype=torch.long),
-        "input_ids": torch.tensor([5, 99, 6, 0, 7]),
-        "text_cu_seqlens": torch.tensor([0, 2, 5]),
-    }
+def test_salm_omits_model_tokens_before_the_model_has_produced_a_counter():
+    model = SimpleNamespace(sampling_rate=16000)
+    batch = {"audio_lens": torch.empty(0, dtype=torch.long)}
 
     measured = SALMThroughputPolicy().measure(model, batch)
 

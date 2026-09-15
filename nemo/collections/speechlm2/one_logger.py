@@ -17,15 +17,13 @@ from nemo.lightning.speech_throughput import (
 
 __all__ = [
     "DuplexSTTThroughputPolicy",
-    "SALMAutomodelThroughputPolicy",
-    "SALMSequenceThroughputPolicy",
     "SALMThroughputPolicy",
     "SpeechToSpeechThroughputPolicy",
 ]
 
 
 class SALMThroughputPolicy(SpeechThroughputPolicy):
-    """Measure input waveform duration for SALM variants."""
+    """Measure audio and exact post-insertion model tokens for every SALM variant."""
 
     name = "salm"
 
@@ -37,22 +35,8 @@ class SALMThroughputPolicy(SpeechThroughputPolicy):
             batch_value(batch, "audio_lens"),
             _sample_rate(model),
         )
+        add_value(measurements, "model_tokens", getattr(model, "_last_batch_num_tokens", None))
         return measurements
-
-
-class SALMSequenceThroughputPolicy(SALMThroughputPolicy):
-    """Measure SALM audio and exact post-expansion mixed-modality positions."""
-
-    def measure(self, model: Any, batch: Any) -> ThroughputMeasurements:
-        measurements = super().measure(model, batch)
-        add_value(measurements, "model_sequence_positions", getattr(model, "_last_batch_num_tokens", None))
-        return measurements
-
-
-class SALMAutomodelThroughputPolicy(SALMSequenceThroughputPolicy):
-    """Use the SALM position schema with a distinct Automodel identity."""
-
-    name = "salm_automodel"
 
 
 class DuplexSTTThroughputPolicy(SpeechThroughputPolicy):

@@ -82,10 +82,9 @@ The available work units depend on the model and batch schema:
    * - Audio-to-audio
      - ``input_audio_seconds``
      -
-   * - SALM and SALMAutomodel
+   * - SALM family
      - ``input_audio_seconds``
-     - ``model_sequence_positions`` when the model exposes its exact
-       post-expansion counter
+     - ``model_tokens`` (text and audio tokens in the post-insertion model sequence)
    * - DuplexSTT
      - ``input_audio_seconds``
      - ``text_tokens``
@@ -93,9 +92,11 @@ The available work units depend on the model and batch schema:
      - ``input_audio_seconds``
      - ``output_audio_seconds``
 
-Measurements use the length tensors from the actual dynamic batch. Packed SALM
-batches use the model's exact post-expansion mixed-modality position counter.
-NeMo Speech does not infer or report micro batch size, global batch size, or a
+Measurements use the length tensors from the actual dynamic batch. Every SALM
+variant reports the exact number of non-padding tokens in the mixed-modality
+model sequence after audio tokens have been inserted; packed batches use their
+pre-parallelism sequence metadata. NeMo Speech does not infer or report micro
+batch size, global batch size, or a
 static sequence length. Audio durations are omitted when a trustworthy sample
 rate or waveform length is unavailable, rather than estimated from unrelated
 configuration.

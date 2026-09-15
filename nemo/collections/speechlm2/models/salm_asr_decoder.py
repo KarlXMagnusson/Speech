@@ -245,6 +245,9 @@ class SALMWithAsrDecoder(LightningModule, HFHubMixin):
                 m.eval()
 
         inputs = self.prepare_inputs(batch)
+        # Count the actual mixed text/audio positions after audio embeddings
+        # have been inserted, excluding padding.
+        self._last_batch_num_tokens = inputs["attention_mask"].long().sum().detach()
         forward_outputs = self(inputs["input_embeds"], attention_mask=inputs["attention_mask"])
         num_frames = (inputs["target_ids"] != -100).long().sum()
         with loss_parallel():
