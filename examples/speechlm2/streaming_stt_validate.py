@@ -41,7 +41,6 @@ class StreamingSTTEvalConfig:
     verbose: bool = True
     device: str = "cuda"
     dtype: str = "bfloat16"
-    use_normalizer: Optional[str] = "english"  # "english", "basic", or "none"
     num_delay_frames: int = 1
 
 

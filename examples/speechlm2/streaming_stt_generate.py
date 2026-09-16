@@ -58,12 +58,9 @@ from lhotse.serialization import SequentialJsonlWriter
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from transformers import GenerationConfig
-from whisper_normalizer.basic import BasicTextNormalizer
-from whisper_normalizer.english import EnglishTextNormalizer
-
 from nemo.collections.asr.metrics.wer import word_error_rate_detail
-from nemo.collections.asr.parts.utils.hf_asr_normalizer import get_hf_normalizer
 from nemo.collections.asr.parts.utils.sot_speaker_alignment import remove_speaker_tags
+from nemo.collections.asr.parts.utils.text_normalizers import build_normalizer
 from nemo.collections.common.data.lhotse.cutset import guess_parse_cutset
 from nemo.collections.common.data.lhotse.dataloader import pad_extra_duration
 from nemo.collections.speechlm2.models import StreamingSTTModel
@@ -184,13 +181,17 @@ class StreamingSTTEvalConfig:
     verbose: bool = True
     device: str = "cuda"
     dtype: str = "bfloat16"
-    # "english"/"basic": Whisper's normalizer (whisper_normalizer package).
-    # "hf": the Open ASR Leaderboard normalizer -- a fork of Whisper's that additionally collapses
-    #       acronyms ("b b c" -> "bbc"), normalizes names, and rewrites compounds ("wi fi" -> "wifi").
-    #       Required to reproduce leaderboard WER; pair with `normalizer_language`.
-    # "none": no normalization.
-    use_normalizer: Optional[str] = "english"  # "english", "basic", "hf", or "none"
-    normalizer_language: str = "en"  # only used by use_normalizer="hf"; non-"en" needs `num2words`
+    # Normalizer FAMILY; `normalizer_language` selects within it (see
+    # nemo/collections/asr/parts/utils/text_normalizers.py).
+    #   "whisper": Whisper's own -- English gets EnglishTextNormalizer, other languages Basic.
+    #   "hf":      the Open ASR Leaderboard fork of it, which additionally collapses acronyms
+    #              ("b b c" -> "bbc"), normalizes names and rewrites compounds ("wi fi" -> "wifi").
+    #              Required to reproduce leaderboard WER.
+    #   "none":    no normalization.
+    # An unrecognised name RAISES -- it used to mean "none", so a typo silently reported
+    # un-normalized numbers.
+    use_normalizer: Optional[str] = "whisper"
+    normalizer_language: str = "en"  # applies to "whisper" and "hf" alike; non-"en" needs `num2words`
     use_offline_embs: bool = False
     seed: Optional[int] = None  # Set for deterministic results
     pad_extra_duration: Optional[float] = 0.0
@@ -349,16 +350,8 @@ def main(cfg: StreamingSTTEvalConfig):
         batch_size=None,
     )
 
-    _normalizer_key = cfg.use_normalizer.lower() if isinstance(cfg.use_normalizer, str) else cfg.use_normalizer
-    if _normalizer_key == "english":
-        normalizer = EnglishTextNormalizer()
-    elif _normalizer_key == "basic":
-        normalizer = BasicTextNormalizer()
-    elif _normalizer_key == "hf":
-        normalizer = get_hf_normalizer(cfg.normalizer_language)
-        logging.info(f"Using Open ASR Leaderboard normalizer (language={cfg.normalizer_language})")
-    else:
-        normalizer = lambda x: x  # noqa: E731
+    normalizer = build_normalizer(cfg.use_normalizer, cfg.normalizer_language)
+    logging.info(f"Using normalizer {cfg.use_normalizer!r} (language={cfg.normalizer_language})")
 
     input_durations = []
     infer_durations = []
