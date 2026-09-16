@@ -93,6 +93,36 @@ class TestNGramGPULanguageModel:
             assert torch.allclose(scores1, scores2)
 
     @pytest.mark.unit
+    @pytest.mark.skipif(not TRITON_AVAILABLE, reason="Triton is not available")
+    @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 CUDA devices")
+    def test_advance_triton_on_non_default_device(self, n_gpu_lm: NGramGPULanguageModel, batch_size=2):
+        """
+        Triton resolves its launch context from torch.cuda.current_device(), which stays at device 0
+        unless explicitly changed; the launch is pinned to the tensors' own device so results are
+        correct, and identical to the PyTorch fallback, when the model lives on a non-default device.
+        A plain eager call like this one does not itself reproduce the "Pointer argument cannot be
+        accessed from Triton" crash seen in production (that additionally requires capturing the
+        launch into a CUDA graph, as the beam decoder does); this run was verified end to end
+        instead, with `examples/asr/asr_streaming_inference/asr_streaming_infer.py
+        asr.device_id=1 asr.decoding.beam.ngram_lm_model=...`, which raises that error before this
+        change and succeeds after it.
+        """
+        device = torch.device("cuda:1")
+        n_gpu_lm = n_gpu_lm.to(device)
+        states = torch.full([batch_size], fill_value=n_gpu_lm.START_STATE, device=device, dtype=torch.int64)
+        assert torch.cuda.current_device() == 0
+
+        with torch.no_grad():
+            scores_triton, states_triton = n_gpu_lm._advance_triton(states=states)
+            scores_pytorch, states_pytorch = n_gpu_lm._advance_pytorch(states=states)
+
+        assert scores_triton.device == device
+        assert states_triton.device == device
+        assert torch.cuda.current_device() == 0
+        assert (states_triton == states_pytorch).all()
+        assert torch.allclose(scores_triton, scores_pytorch)
+
+    @pytest.mark.unit
     @pytest.mark.skipif(not KENLM_AVAILABLE, reason="KenLM is not available")
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("bos", [True, False])
