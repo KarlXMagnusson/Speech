@@ -42,15 +42,17 @@ from __future__ import annotations
 
 import math
 import os
+import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import partial
 from pathlib import Path
 from time import perf_counter
-from typing import Optional
+from typing import Callable, NamedTuple, Optional
 
 import lhotse.dataset
 import torch
+from kaldialign import edit_distance
 from lhotse import CutSet
 from lhotse.serialization import SequentialJsonlWriter
 from omegaconf import OmegaConf
@@ -65,9 +67,26 @@ from nemo.collections.asr.parts.utils.sot_speaker_alignment import remove_speake
 from nemo.collections.common.data.lhotse.cutset import guess_parse_cutset
 from nemo.collections.common.data.lhotse.dataloader import pad_extra_duration
 from nemo.collections.speechlm2.models import StreamingSTTModel
-from nemo.collections.speechlm2.parts.metrics import CpWER
+from nemo.collections.speechlm2.parts.metrics import CpWER, CpWERSessionResult
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
+
+
+class ReducedRecord(NamedTuple):
+    """One recording's results, after segments (if any) are regrouped.
+
+    Replaces the 7-tuple this used to be so that `meta` can ride along: the cut object is dropped
+    at construction time, and `cut.custom` is unreachable from anywhere downstream.
+    """
+
+    id: str
+    duration: float
+    ref_raw: str  # cut.supervisions[0].text, verbatim -- tags intact
+    hyp_raw: str  # model output, verbatim -- tags intact
+    alignments: Optional[list]
+    content_scores: Optional[list]
+    annotated: Optional[str]
+    meta: dict  # {'custom': <the input manifest row>}, or {} when the cut carries none
 
 
 class ToAudio(torch.utils.data.Dataset):
@@ -448,12 +467,13 @@ def main(cfg: StreamingSTTEvalConfig):
     if debug_log_writer is not None:
         debug_log_writer.close()
 
-    # --- Reduce per-cut results to one (ref, hyp, ...) per recording ---
+    # --- Reduce per-cut results to one ReducedRecord per recording ---
     # In seg_mode: concatenate each recording's segment hypotheses (ordered by
     # seg_index) and its offset-adjusted alignments; the reference is the full
     # recording supervision. In normal mode: one recording == one cut.
-    # Each entry: (id, duration, ref, hyp, alignments|None, content_scores|None, annotated|None).
-    reduced: list[tuple] = []
+    # `meta` is captured from the cut HERE, because the cut object is not reachable
+    # downstream -- everything after this point sees only ReducedRecord.
+    reduced: list[ReducedRecord] = []
     if seg_mode:
         for rec in ref_cuts:
             segs = sorted(seg_meta.get(rec.id, []), key=lambda t: t[0])
@@ -462,34 +482,36 @@ def main(cfg: StreamingSTTEvalConfig):
             if cfg.save_alignments:
                 alignments = [w for _, sid, _ in segs for w in align_by_id.get(sid, [])]
             reduced.append(
-                (
-                    rec.id,
-                    rec.duration,
-                    rec.supervisions[0].text,
-                    hyp_raw,
-                    alignments,
-                    None,
-                    None,
+                ReducedRecord(
+                    id=rec.id,
+                    duration=rec.duration,
+                    ref_raw=rec.supervisions[0].text,
+                    hyp_raw=hyp_raw,
+                    alignments=alignments,
+                    content_scores=None,
+                    annotated=None,
+                    meta=_cut_meta(rec),
                 )
             )
     else:
         for cut in cuts:
             reduced.append(
-                (
-                    cut.id,
-                    cut.duration,
-                    cut.supervisions[0].text,
-                    hyp_by_id.get(cut.id, ""),
-                    align_by_id.get(cut.id) if cfg.save_alignments else None,
-                    content_score_by_id.get(cut.id),
-                    annotated_by_id.get(cut.id),
+                ReducedRecord(
+                    id=cut.id,
+                    duration=cut.duration,
+                    ref_raw=cut.supervisions[0].text,
+                    hyp_raw=hyp_by_id.get(cut.id, ""),
+                    alignments=align_by_id.get(cut.id) if cfg.save_alignments else None,
+                    content_scores=content_score_by_id.get(cut.id),
+                    annotated=annotated_by_id.get(cut.id),
+                    meta=_cut_meta(cut),
                 )
             )
 
     # Strip speaker tags BEFORE normalizing for the speaker-agnostic WER. Without this, a pure
     # speaker swap with word-identical content scores as word errors when use_normalizer=none.
-    refs = [normalizer(remove_speaker_tags(r[2])) for r in reduced]
-    hyps = [normalizer(remove_speaker_tags(r[3])) for r in reduced]
+    refs = [normalizer(remove_speaker_tags(r.ref_raw)) for r in reduced]
+    hyps = [normalizer(remove_speaker_tags(r.hyp_raw)) for r in reduced]
     wer, _, nins, ndel, nsub = word_error_rate_detail(hypotheses=hyps, references=refs, use_cer=False)
 
     cpwer_metric = cpwer_results = None
@@ -504,8 +526,8 @@ def main(cfg: StreamingSTTEvalConfig):
             verbose=False,
         )
         # Score per session from the RAW pairs, then aggregate. Same hypotheses as the WER above.
-        cpwer_results = {r[0]: cpwer_metric.score_session(r[2], r[3]) for r in reduced}
-        cpwer_metric.update("corpus", [r[2] for r in reduced], [r[3] for r in reduced])
+        cpwer_results = {r.id: cpwer_metric.score_session(r.ref_raw, r.hyp_raw) for r in reduced}
+        cpwer_metric.update("corpus", [r.ref_raw for r in reduced], [r.hyp_raw for r in reduced])
         cpwer_summary = cpwer_metric.compute()
     rtfx = sum(input_durations) / sum(infer_durations)
     logging.info(f"WER: {wer:.2%} [ins={nins:.2%} del={ndel:.2%} sub={nsub:.2%}]")
@@ -540,55 +562,236 @@ def main(cfg: StreamingSTTEvalConfig):
             for line in cpwer_lines:
                 f.write(line + "\n")
             f.write(f"=============================================\n\n")
+        run_block = _build_run_block(cfg, seg_mode=seg_mode)
         with SequentialJsonlWriter(cfg.output_manifest) as writer:
-            for rec_id, duration, ref_raw, hyp_raw, alignments, content_scores, annotated in reduced:
-                ref = normalizer(remove_speaker_tags(ref_raw))
-                hyp = normalizer(remove_speaker_tags(hyp_raw))
-                uwer, _, unins, undel, unsub = word_error_rate_detail(
-                    hypotheses=[hyp], references=[ref], use_cer=False
-                )
-                record = {
-                    "id": rec_id,
-                    "duration": duration,
-                    "text": ref,
-                    "pred_text": hyp,
-                    "wer": uwer,
-                    "ins": unins,
-                    "del": undel,
-                    "sub": unsub,
-                }
-                if cpwer_results is not None and rec_id in cpwer_results:
-                    session = cpwer_results[rec_id]
-                    record.update(
-                        {
-                            "cpwer": session.cpwer,
-                            "cpwer_errors": session.errors,
-                            "cpwer_ref_words": session.ref_words,
-                            "cpwer_ins": session.ins,
-                            "cpwer_del": session.dels,
-                            "cpwer_sub": session.subs,
-                            "num_ref_speakers": session.num_ref_speakers,
-                            "num_hyp_speakers": session.num_hyp_speakers,
-                            "ref_by_speaker": session.ref_by_speaker,
-                            # permuted into REFERENCE order by the assignment -- sorting the two
-                            # speaker dicts independently would misalign them whenever the key sets
-                            # differ (hyp {0,2} vs ref {0,1}).
-                            "hyp_by_speaker": session.hyp_in_ref_order,
-                            "cpwer_assignment": session.assignment,
-                            "notag_ceiling": session.notag_ceiling,
-                        }
-                    )
-                # Per-word predicted timestamps (same schema as the GT manifest's
-                # `alignments` field: text / start_time / end_time, in seconds).
-                # In seg_mode these are already shifted to recording-global time.
-                if alignments is not None:
-                    record["pred_alignments"] = alignments
-                if content_scores is not None:
-                    record["content_scores"] = content_scores
-                    record["content_score_mode"] = content_score_mode
-                if annotated is not None:
-                    record["pred_text_annotated"] = annotated
-                writer.write(record)
+            for rec in reduced:
+                cpwer_result = cpwer_results.get(rec.id) if cpwer_results is not None else None
+                writer.write(_build_record(rec, normalizer, run_block, cpwer_result, content_score_mode))
+
+
+def _cut_meta(cut) -> dict:
+    """The input manifest row for this cut, nested whole under ``custom``.
+
+    Nested rather than flattened onto the record, because `cut.custom` carries both ``text`` (the
+    RAW reference) and ``duration`` (the UNPADDED one) under names the record already uses for
+    different values -- flattening would silently overwrite the normalized ``text`` every consumer
+    reads, with no error. Nesting also keeps the record's own schema a function of the code rather
+    than of whatever the input manifest happened to contain, so a test can assert it.
+
+    Copied as-is, with no allowlist: whatever the input carried is carried through, so re-scoring
+    never has to go back to the input manifest for a field nobody anticipated.
+
+    Args:
+        cut: a lhotse cut. ``cut.custom`` may be ``None`` (a MonoCut built without one) or ``{}``
+            (a MixedCut whose tracks carry none); both are tolerated.
+
+    Returns:
+        dict: ``{"custom": <a copy of the input manifest row>}``, or ``{}`` when the cut carries
+            nothing -- an absent ``custom`` key and an empty one are different things to a reader,
+            so the empty case writes no key at all. Spread into the record by the caller.
+    """
+    custom = getattr(cut, "custom", None) or {}
+    if not custom:
+        return {}
+    return {"custom": dict(custom)}
+
+
+def _wer_counts(ref: str, hyp: str) -> dict:
+    """The five integer WER counts for one row, from a single edit-distance call.
+
+    Args:
+        ref: the reference, already normalized and tag-stripped -- i.e. the same string written to
+            the record's ``text``, so the counts describe exactly what ``wer`` describes.
+        hyp: the hypothesis, under the same treatment (the record's ``pred_text``).
+
+    Returns:
+        dict: ``wer_errors``, ``wer_ref_words``, ``wer_ins``, ``wer_del``, ``wer_sub``, all ``int``,
+            with ``wer_errors == wer_ins + wer_del + wer_sub``. Well-defined on an empty reference
+            (``wer_ref_words == 0`` and every error is an insertion) -- no division and no sentinel,
+            unlike the ``wer`` rate beside them, which is ``inf`` in that case.
+    """
+    ref_words, hyp_words = ref.split(), hyp.split()
+    d = edit_distance(ref_words, hyp_words)
+    return {
+        "wer_errors": int(d["total"]),
+        "wer_ref_words": len(ref_words),
+        "wer_ins": int(d["ins"]),
+        "wer_del": int(d["del"]),
+        "wer_sub": int(d["sub"]),
+    }
+
+
+def _head_sha() -> Optional[str]:
+    """Short sha of the working tree, or ``None`` when not in a checkout.
+
+    `nemo.package_info.__version__` is stamped at install time, so on an editable install it goes
+    stale the moment a commit lands -- it identifies the release, not the code that ran. This is the
+    live counterpart; both are recorded.
+
+    Returns:
+        Optional[str]: the abbreviated sha of ``HEAD``, or ``None`` when git is unavailable, the
+            call fails, or the file is not inside a checkout (e.g. an installed wheel). Never
+            raises -- provenance must not be able to fail a run.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        return out.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _build_run_block(cfg: StreamingSTTEvalConfig, *, seg_mode: bool) -> dict:
+    """Per-row provenance: what produced this manifest, and what a scorer must refuse on.
+
+    Written on EVERY row rather than to a sidecar or a header line. A sidecar is lost the moment two
+    arms are `cat`ed together, and a header breaks strict one-record-per-line readers -- and
+    surviving exactly that concatenation is the whole point, since `placement` and `seg_mode` are
+    what let an offline scorer refuse work it cannot score correctly.
+
+    Args:
+        cfg: the resolved run config; every value recorded is read from it, so the block cannot
+            drift from what actually ran.
+        seg_mode: whether long-form segmentation was active. Keyword-only because it is derived
+            (``max_segment_duration`` set and positive), not a config field, and a positional bool
+            beside ``cfg`` would be unreadable at the call site.
+
+    Returns:
+        dict: one flat block, identical for every row of a run. Groups: writer provenance
+            (``build``, ``head_sha``); what a scorer must refuse on (``placement``, ``seg_mode``,
+            ``max_segment_duration``, ``seg_method``); what it needs to re-derive ``text`` /
+            ``pred_text`` (``inference_normalizer``, ``normalizer_language``); and the run knobs
+            that change the hypothesis, so two manifests are only comparable where these agree.
+    """
+    from nemo.package_info import __version__ as nemo_version
+
+    return {
+        "build": nemo_version,
+        "head_sha": _head_sha(),
+        # --- what a scorer must refuse on ---
+        "placement": cfg.cpwer_placement,
+        "seg_mode": seg_mode,
+        "max_segment_duration": cfg.max_segment_duration,
+        "seg_method": cfg.seg_method,
+        # --- needed to re-derive `text` / `pred_text` ---
+        "inference_normalizer": cfg.use_normalizer,
+        "normalizer_language": cfg.normalizer_language,
+        # --- run knobs that change the hypothesis, so two manifests are only comparable if equal ---
+        "pretrained_name": cfg.pretrained_name,
+        "inputs": cfg.inputs,
+        "seed": cfg.seed,
+        "pad_extra_duration": cfg.pad_extra_duration,
+        "max_new_tokens": cfg.max_new_tokens,
+        "system_prompt": cfg.system_prompt,
+        # The single biggest confound for a multi-speaker number: oracle RTTM targets versus the
+        # streaming diarizer. A manifest that does not record it cannot be compared to another.
+        "oracle_spk_targets": cfg.oracle_spk_targets,
+        "use_state_machine_inference": cfg.use_state_machine_inference,
+        "chunk_size_override": cfg.chunk_size_override,
+        "emit_threshold": cfg.emit_threshold,
+    }
+
+
+def _build_record(
+    rec: ReducedRecord,
+    normalizer: Callable[[str], str],
+    run_block: dict,
+    cpwer_result: Optional[CpWERSessionResult],
+    content_score_mode: Optional[str],
+) -> dict:
+    """Assemble one output-manifest row.
+
+    Split out of the writer loop so the schema is testable without a GPU or a model: the unit tests
+    assert the key inventory, the raw round-trip and the ``_run`` block against this function
+    directly.
+
+    Args:
+        rec: the reduced record for one recording, carrying the verbatim reference and hypothesis.
+        normalizer: the text normalizer to apply. Called AFTER speaker tags are stripped, which is
+            what makes ``text`` / ``pred_text`` lossy and ``text_raw`` / ``pred_text_raw``
+            necessary.
+        run_block: the shared ``_run`` provenance block; built once per run, not per row.
+        cpwer_result: this recording's cpWER scores, or ``None`` when cpWER did not run
+            (``compute_cpwer=false``, or the id was not scored). When ``None`` the row carries no
+            ``cpwer*`` keys at all rather than nulls.
+        content_score_mode: run-level label for ``content_scores``; ignored when the record has
+            none.
+
+    Returns:
+        dict: the row, ready to serialize. Always carries the identity, both text pairs, the WER
+            rates and counts, and ``_run``; carries ``custom``, the ``cpwer*`` block,
+            ``pred_alignments``, ``content_scores`` and ``pred_text_annotated`` only when the
+            corresponding input is present, so an absent key means absent data rather than null.
+    """
+    rec_id, ref_raw, hyp_raw = rec.id, rec.ref_raw, rec.hyp_raw
+    ref = normalizer(remove_speaker_tags(ref_raw))
+    hyp = normalizer(remove_speaker_tags(hyp_raw))
+    uwer, _, unins, undel, unsub = word_error_rate_detail(hypotheses=[hyp], references=[ref], use_cer=False)
+    record = {
+        "id": rec_id,
+        "duration": rec.duration,
+        "text": ref,
+        "pred_text": hyp,
+        # RAW, verbatim: tags intact, no normalizer, no tag stripping. `text` and
+        # `pred_text` above are lossy -- every Whisper-style normalizer deletes
+        # `<spk:N>` as a bracket span -- so these two are the only fields that make
+        # offline re-scoring under a different normalizer or parser possible.
+        "text_raw": ref_raw,
+        "pred_text_raw": hyp_raw,
+        "wer": uwer,
+        "ins": unins,
+        "del": undel,
+        "sub": unsub,
+        # Integer counts alongside the rates above. Naming follows the row's existing convention:
+        # a bare name is a RATE (`wer`, `ins`), a prefixed one is a COUNT (`wer_errors`, `wer_ins`).
+        # Counts are not derivable from the rates -- `word_error_rate_detail` returns rates and a
+        # word total only, and `wer` is inf on an empty reference -- so they come from one direct
+        # edit_distance call.
+        **_wer_counts(ref, hyp),
+        # Provenance, on every row including runs where cpWER never ran: `placement`
+        # and `seg_mode` are what let an offline scorer REFUSE invalid work.
+        "_run": run_block,
+        # The input manifest row, nested whole. Per-subset bucketing reads its key out of here
+        # (`custom.subset_for_metrics` by default). See _cut_meta.
+        **rec.meta,
+    }
+    if cpwer_result is not None:
+        record.update(
+            {
+                "cpwer": cpwer_result.cpwer,
+                "cpwer_errors": cpwer_result.errors,
+                "cpwer_ref_words": cpwer_result.ref_words,
+                "cpwer_ins": cpwer_result.ins,
+                "cpwer_del": cpwer_result.dels,
+                "cpwer_sub": cpwer_result.subs,
+                "num_ref_speakers": cpwer_result.num_ref_speakers,
+                "num_hyp_speakers": cpwer_result.num_hyp_speakers,
+                "ref_by_speaker": cpwer_result.ref_by_speaker,
+                # permuted into REFERENCE order by the assignment -- sorting the two
+                # speaker dicts independently would misalign them whenever the key sets
+                # differ (hyp {0,2} vs ref {0,1}).
+                "hyp_by_speaker": cpwer_result.hyp_in_ref_order,
+                "cpwer_assignment": cpwer_result.assignment,
+                "notag_ceiling": cpwer_result.notag_ceiling,
+            }
+        )
+    # Per-word predicted timestamps (same schema as the GT manifest's
+    # `alignments` field: text / start_time / end_time, in seconds).
+    # In seg_mode these are already shifted to recording-global time.
+    if rec.alignments is not None:
+        record["pred_alignments"] = rec.alignments
+    if rec.content_scores is not None:
+        record["content_scores"] = rec.content_scores
+        record["content_score_mode"] = content_score_mode
+    if rec.annotated is not None:
+        record["pred_text_annotated"] = rec.annotated
+    return record
 
 
 if __name__ == "__main__":
