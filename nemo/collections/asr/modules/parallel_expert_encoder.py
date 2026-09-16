@@ -71,8 +71,10 @@ _SPEAKER_FEATURE_MODES = frozenset({_SPEAKER_FEATURE_MODE_CONTINUOUS, _SPEAKER_F
 _BUNDLE_CONFIG_OVERRIDE_KEYS = frozenset(
     {
         "asr_normalize_type",
+        "chunk_size_seconds",
         "ctc_timestamp_model_path",
         "diar_normalize_type",
+        "frame_shift_seconds",
         "missing_rttm_target",
         "speaker_activity_threshold",
         "speaker_feature_config_version",
@@ -249,6 +251,16 @@ def _read_bundle_members(nemo_path: str) -> tuple[DictConfig, dict[str, torch.Te
 class ParallelExpertEncoderPT(ModelPT):
     """ModelPT shell for saving and restoring a PE ``.nemo`` archive."""
 
+    @classmethod
+    def list_available_models(cls) -> List[PretrainedModelInfo]:
+        return []
+
+    def setup_training_data(self, train_data_config: Union[DictConfig, dict]):
+        pass
+
+    def setup_validation_data(self, val_data_config: Union[DictConfig, dict]):
+        pass
+
     def __init__(self, cfg: DictConfig, trainer: Optional[Trainer] = None):
         """Initialize a serializable Parallel Expert Encoder wrapper.
 
@@ -277,6 +289,8 @@ class ParallelExpertEncoderPT(ModelPT):
             speaker_feature_mode=speaker_feature_mode,
             speaker_activity_threshold=speaker_activity_threshold,
             spk_kernel_scale=self._cfg.get("spk_kernel_scale", 1.0),
+            frame_shift_seconds=self._cfg.get("frame_shift_seconds", 0.01),
+            chunk_size_seconds=self._cfg.get("chunk_size_seconds", None),
             sync_max_audio_length=self._cfg.get("sync_max_audio_length", False),
             ctc_timestamp_model_path=self._cfg.get("ctc_timestamp_model_path", None),
         )
@@ -447,6 +461,8 @@ class ParallelExpertEncoderPT(ModelPT):
         template_cfg.speaker_feature_config_version = _SPEAKER_FEATURE_CONFIG_VERSION
         template_cfg.speaker_feature_mode = encoder.speaker_feature_mode
         template_cfg.speaker_activity_threshold = encoder.speaker_activity_threshold
+        template_cfg.frame_shift_seconds = encoder.frame_shift_seconds
+        template_cfg.chunk_size_seconds = encoder.chunk_size_seconds
         template_cfg.sync_max_audio_length = encoder.sync_max_audio_length
         template_cfg.ctc_timestamp_model_path = encoder.ctc_timestamp_model_path
         shell._cfg = template_cfg
@@ -484,6 +500,8 @@ class ParallelExpertEncoder(nn.Module):
         speaker_feature_mode: Optional[str] = None,
         speaker_activity_threshold: Optional[float] = None,
         spk_kernel_scale: float = 1.0,
+        frame_shift_seconds: float = 0.01,
+        chunk_size_seconds: Optional[float] = None,
         sync_max_audio_length: bool = False,
         ctc_timestamp_model_path: Optional[str] = None,
     ):
@@ -507,6 +525,8 @@ class ParallelExpertEncoder(nn.Module):
             speaker_feature_mode (Optional[str]): Continuous or thresholded speaker-feature mode.
             speaker_activity_threshold (Optional[float]): Activity threshold for thresholded fusion.
             spk_kernel_scale (float): Scale applied to the sinusoidal speaker infusion.
+            frame_shift_seconds (float): Duration represented by one input feature frame.
+            chunk_size_seconds (Optional[float]): Optional independent-branch chunk duration.
             sync_max_audio_length (bool): Whether child encoders synchronize maximum sequence lengths.
             ctc_timestamp_model_path (Optional[str]): Local CTC timestamp adapter path.
         """
@@ -564,6 +584,10 @@ class ParallelExpertEncoder(nn.Module):
 
         self.freeze_diar = bool(freeze_diar)
         self.freeze_asr = bool(freeze_asr)
+        self.frame_shift_seconds = float(frame_shift_seconds)
+        if self.frame_shift_seconds <= 0:
+            raise ValueError(f"frame_shift_seconds must be positive, got {frame_shift_seconds}.")
+        self.chunk_size_seconds = self._validate_chunk_size("chunk_size_seconds", chunk_size_seconds)
         self.online_inference_length = int(online_inference_length)
         self.online_inference_enabled: Optional[bool] = None
         self.chunk_left_context = max(0, int(chunk_left_context))
@@ -647,6 +671,15 @@ class ParallelExpertEncoder(nn.Module):
             for index, layer in enumerate(layers):
                 if getattr(layer, "_checkpoint_wrapped_module", None) is None:
                     layers[index] = checkpoint_wrapper(layer)
+
+    @staticmethod
+    def _validate_chunk_size(name: str, value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        value = float(value)
+        if value <= 0:
+            raise ValueError(f"{name} must be positive or None, got {value}.")
+        return value
 
     def _asr_output_frame_boundary(self, input_frame_boundary: int) -> int:
         """Map an input-frame boundary to the selected ASR encoder's output grid."""
