@@ -27,13 +27,14 @@ from typing import Callable, Optional
 from whisper_normalizer.basic import BasicTextNormalizer
 from whisper_normalizer.english import EnglishTextNormalizer
 
+from nemo.collections.asr.parts.utils.chime8_normalizer import get_chime8_normalizer
 from nemo.collections.asr.parts.utils.hf_asr_normalizer import get_hf_normalizer
 
 __all__ = ["build_normalizer", "get_whisper_normalizer", "NORMALIZER_NAMES"]
 
 #: Accepted ``use_normalizer`` values. Family names, not class names: the language selects the
 #: concrete normalizer within a family.
-NORMALIZER_NAMES = ("whisper", "hf", "none")
+NORMALIZER_NAMES = ("whisper", "hf", "chime8", "none")
 
 
 def build_normalizer(name: Optional[str], language: str = "en") -> Callable[[str], str]:
@@ -45,7 +46,8 @@ def build_normalizer(name: Optional[str], language: str = "en") -> Callable[[str
 
     Args:
         name: family name, case-insensitive. ``whisper`` (Whisper's own normalizers), ``hf`` (the
-            Open ASR Leaderboard fork, required to reproduce leaderboard WER), or ``none``.
+            Open ASR Leaderboard fork, required to reproduce leaderboard WER), ``chime8`` (the
+            CHiME-8 scorer, English only), or ``none``.
             ``None``, ``"none"``, and an empty or whitespace-only string all mean identity.
             Surrounding whitespace is stripped, so a stray space in a config value is not a typo.
         language: BCP-47-ish code, e.g. ``"en"``, ``"de"``. Selects within the chosen family; it is
@@ -64,6 +66,8 @@ def build_normalizer(name: Optional[str], language: str = "en") -> Callable[[str
         return get_whisper_normalizer(language)
     if key == "hf":
         return get_hf_normalizer(language)
+    if key == "chime8":
+        return get_chime8_normalizer(language)
     if key == "none":
         return _identity
     raise ValueError(f"Unknown normalizer {name!r}. Accepted: {', '.join(NORMALIZER_NAMES)} (or None for identity).")
