@@ -33,6 +33,39 @@ _SPEAKER_STRUCTURAL_PATTERN = re.compile(r"<spk_[a-z]+>")
 
 _MALFORMED_SPEAKER_TOKEN = re.compile(r"<spk:?\d*>?")
 
+# Tag syntaxes a speaker run may open with. Every pattern exposes exactly one group named `spk`
+# holding the speaker index, so the parser needs no per-syntax branching. These are SEPARATE from
+# the four module-level regexes above, which stay byte-identical because the training data path
+# (`salm_dataset`, `streaming_stt_dataset`) and `scripts/speechlm2/align_manifest.py` import them
+# by name.
+#
+# A group name may appear only once per pattern, so alternatives are numbered and the parser reads
+# whichever one matched (see `_speaker_of`).
+_TAG_PATTERNS = {
+    'spk': r"<spk:(?P<spk1>\d+)>",
+    'bracket': r"\[s(?P<spk1>\d+)\]",
+    'spk+bracket': r"<spk:(?P<spk1>\d+)>|\[s(?P<spk2>\d+)\]",
+    # `speaker 3-4 was chosen` matches as a tag for speaker 3. Inherited deliberately: the pattern
+    # is what another scorer uses, and diverging would silently change agreement with it.
+    'canonical': r"<spk:(?P<spk1>\d+)>|\[s(?P<spk2>\d+)\]|(?:^|\s)speaker[_\s-]*(?P<spk3>\d+)\s*[:-]",
+}
+
+# Literal spellings other scorers use on the command line, mapped onto the axis values above, so a
+# copied invocation works unchanged.
+_TAG_SYNTAX_ALIASES = {
+    '<spk:*>': 'spk',
+    '<spk:n>': 'spk',
+    'spk': 'spk',
+    'spk_tag': 'spk',
+    '[s*]': 'bracket',
+    '[sn]': 'bracket',
+    's_bracket': 'bracket',
+    '[s0]': 'bracket',
+    'both': 'spk+bracket',
+    'all': 'spk+bracket',
+}
+
+
 __all__ = [
     "sot_to_speaker_texts",
     "remove_speaker_tags",
@@ -159,37 +192,75 @@ def sot_to_speaker_texts(
     keep_empty: bool = True,
     max_speakers: Optional[int] = None,
     placement: str = 'prefix',
+    *,
+    tag_syntax: str = 'spk',
+    case_sensitive: bool = True,
+    drop_tag_residue: bool = True,
+    speaker_order: str = 'index',
 ) -> dict:
-    """Group SOT-tagged text into ``{speaker_index: concatenated_text}``, keys ascending.
+    """Group SOT-tagged text into ``{speaker_index: concatenated_text}``.
 
     This is what cpWER consumes: one string per speaker. Deliberately not built on the neighbouring
     helpers -- :func:`parse_speaker_tokens` silently drops every word before the first tag (so
     ``"um <spk:0> hi"`` loses ``um`` to a phantom deletion), and :func:`strip_speaker_tags` *raises*
     on untagged text, which would crash scoring of a tagless hypothesis.
 
+    The keyword-only arguments are scoring *axes*: each one independently selects a behaviour that
+    some other scorer has, so a number can be reproduced without adopting a whole foreign pipeline.
+    Every default reproduces this function's original behaviour exactly.
+
     Args:
         text: SOT text, possibly untagged, possibly malformed. ``None``/empty yields ``{}``.
-        default_speaker: Bucket for words appearing before any tag. ``None`` drops them, which
-            turns them into silent deletions -- only do that deliberately.
-        keep_empty: Keep a speaker whose contribution is empty. Required for scoring: the bucket
-            count must be decided by the TAGS, never by downstream text normalization. A reference
-            speaker whose only word is a filler would otherwise vanish once the normalizer removes
-            it, deleting a whole reference speaker and misaligning the permutation search.
+        default_speaker: Bucket for words appearing before any tag. ``None`` drops them, which turns
+            them into silent deletions -- and, when the text has no tag at all, yields ``{}``.
+        keep_empty: Keep a speaker whose contribution is empty. Required when the bucket count must
+            be decided by the TAGS rather than by downstream text normalization: a reference speaker
+            whose only word is a filler would otherwise vanish once a normalizer removes it,
+            deleting a whole reference speaker and misaligning a permutation search.
         max_speakers: Fold indices ``>= max_speakers`` into one bucket rather than creating new
-            speakers. Folds, never drops.
-        placement: ``'prefix'`` (default) assigns words to the tag that PRECEDES them, i.e.
-            ``<spk:0> a b <spk:1> c``. ``'suffix'`` assigns words to the tag that FOLLOWS them,
+            speakers. Folds, never drops. Note ``max_speakers=N`` yields ``N+1`` buckets.
+        placement: ``'prefix'`` (default) assigns words to the tag that PRECEDES them,
+            ``<spk:0> a b <spk:1> c``. ``'suffix'`` assigns them to the tag that FOLLOWS,
             ``a b <spk:0> c <spk:1>`` -- the deferred-identity target format. In suffix mode a
             trailing run with no closing tag falls to ``default_speaker``; those words are orphaned
             rather than inheriting the previous speaker, which is the failure mode worth watching.
+        tag_syntax: which tag pattern opens a speaker run. ``'spk'`` (default) is ``<spk:N>``;
+            ``'bracket'`` is ``[sN]``; ``'spk+bracket'`` accepts either; ``'canonical'`` accepts
+            those plus ``speaker N:`` / ``speaker_N -``. Ten literal aliases are accepted so a
+            command line copied from another scorer works unchanged.
+        case_sensitive: ``False`` recompiles the selected pattern with ``re.IGNORECASE``, so
+            ``<SPK:0>`` is a tag rather than two fake words. Default ``True`` matches this
+            function's historical behaviour.
+        drop_tag_residue: ``True`` (default) discards malformed tag residue such as an unclosed
+            ``<spk:0`` so it cannot survive normalization as the fake words ``spk`` and ``0``.
+            ``False`` scores it as text, which is what a scorer without such a filter does.
+        speaker_order: ``'index'`` (default) returns buckets sorted by ascending speaker index;
+            ``'first_seen'`` returns them in order of first appearance. Keys are ``int`` either
+            way. This changes only the ins/del/sub split of a downstream alignment, never the
+            error total or the reference word count.
 
     Returns:
-        dict: speaker index -> concatenated text, ordered by ascending index.
+        dict: speaker index -> concatenated text.
+
+    Three behaviours below look like bugs and are not:
+
+    * ``<spk_switch>`` and friends are stripped in EVERY configuration, including
+      ``drop_tag_residue=False``. They are structural markers that open a run in the
+      deferred-identity format, not words -- scoring them would inflate the reference word count.
+    * ``'canonical'`` matches ``speaker 3-4 was chosen`` as a tag for speaker 3. The false positive
+      is inherited deliberately, because the pattern is what another scorer uses and diverging from
+      it would silently change agreement with that scorer.
+    * ``default_speaker`` is materialised only if a word actually precedes the first tag. Creating
+      it eagerly would invent an empty speaker for ``"<spk:2> hi"``, inflating the speaker count.
     """
     if not text:
         return {}
 
-    buckets: dict = {}
+    pattern = _resolve_tag_pattern(tag_syntax, case_sensitive)
+    # Collapse whitespace up front so a tag split never leaves ragged runs behind. Measured to make
+    # no difference to any produced bucket; done because it makes the cursor arithmetic below
+    # readable, not because a caller can observe it.
+    cleaned = " ".join(text.split())
 
     def _fold(index):
         if index is None:
@@ -198,53 +269,49 @@ def sot_to_speaker_texts(
             index = max_speakers
         return index
 
-    # `default_speaker` is only materialised if a word actually precedes the first tag. Creating it
-    # eagerly would invent an empty speaker for "<spk:2> hi", inflating the speaker count and adding
-    # a padding slot the permutation search then has to absorb.
-    current = _fold(default_speaker)
-    if placement == 'suffix':
-        pending: list = []
-        for piece in _SPEAKER_TOKEN_SPLIT_PATTERN.split(text):
-            if not piece:
+    def _words(chunk: str) -> list:
+        out = []
+        for word in chunk.split():
+            if _SPEAKER_STRUCTURAL_PATTERN.fullmatch(word):
+                continue  # structural marker, never a word -- stripped on every axis setting
+            if drop_tag_residue and _MALFORMED_SPEAKER_TOKEN.fullmatch(word):
                 continue
-            tag = SPEAKER_TOKEN_PATTERN.fullmatch(piece)
-            if tag is not None:
-                owner = _fold(int(tag.group(1)))
-                if owner is not None:
-                    buckets.setdefault(owner, []).extend(pending)
-                pending = []
-                continue
-            pending += [
-                w
-                for w in piece.split()
-                if not _MALFORMED_SPEAKER_TOKEN.fullmatch(w) and not _SPEAKER_STRUCTURAL_PATTERN.fullmatch(w)
-            ]
-        # Words after the last tag never got closed: the model omitted the trailing identity.
-        if pending and current is not None:
-            buckets.setdefault(current, []).extend(pending)
-        out = {i: " ".join(w) for i, w in sorted(buckets.items())}
-        return out if keep_empty else {i: t for i, t in out.items() if t}
+            out.append(word)
+        return out
 
-    for piece in _SPEAKER_TOKEN_SPLIT_PATTERN.split(text):
-        if not piece:
-            continue
-        tag = SPEAKER_TOKEN_PATTERN.fullmatch(piece)
-        if tag is not None:
-            current = _fold(int(tag.group(1)))
+    buckets: dict = {}
+    suffix = placement == 'suffix'
+    current = _fold(default_speaker)
+    pending: list = []
+    cursor = 0
+
+    for match in pattern.finditer(cleaned):
+        owner = _fold(_speaker_of(match))
+        chunk = _words(cleaned[cursor : match.start()])
+        cursor = match.end()
+        if suffix:
+            # The tag CLOSES the run before it, so this chunk belongs to `owner`.
+            if owner is not None:
+                buckets.setdefault(owner, []).extend(pending + chunk)
+            pending = []
+        else:
+            # The tag OPENS a run, so this chunk belongs to whoever was current.
+            if chunk and current is not None:
+                buckets.setdefault(current, []).extend(chunk)
+            current = owner
             if keep_empty and current is not None:
                 buckets.setdefault(current, [])
-            continue
-        # Drop malformed tag residue (e.g. an unclosed "<spk:0") so it does not survive
-        # normalization as the fake words "spk" and "0".
-        words = [
-            w
-            for w in piece.split()
-            if not _MALFORMED_SPEAKER_TOKEN.fullmatch(w) and not _SPEAKER_STRUCTURAL_PATTERN.fullmatch(w)
-        ]
-        if words and current is not None:
-            buckets.setdefault(current, []).extend(words)
 
-    out = {i: " ".join(words) for i, words in sorted(buckets.items())}
+    tail = _words(cleaned[cursor:])
+    if suffix:
+        # Words after the last tag were never closed: the model omitted the trailing identity.
+        if (pending or tail) and current is not None:
+            buckets.setdefault(current, []).extend(pending + tail)
+    elif tail and current is not None:
+        buckets.setdefault(current, []).extend(tail)
+
+    items = buckets.items() if speaker_order == 'first_seen' else sorted(buckets.items())
+    out = {i: " ".join(words) for i, words in items}
     if not keep_empty:
         out = {i: t for i, t in out.items() if t}
     return out
@@ -538,3 +605,33 @@ def collate_speaker_activity_targets(
         ]
     )
     return targets, target_length
+
+
+def _resolve_tag_pattern(tag_syntax: str, case_sensitive: bool):
+    """Compiled tag pattern for one axis setting.
+
+    Args:
+        tag_syntax: an axis value or one of the accepted literal aliases.
+        case_sensitive: ``False`` adds ``re.IGNORECASE``.
+
+    Returns:
+        re.Pattern: exposes one group per alternative; the parser reads whichever matched.
+
+    Raises:
+        ValueError: on an unrecognised syntax, naming the accepted values -- silently falling back
+            would score a whole corpus as one speaker.
+    """
+    key = (tag_syntax or 'spk').strip().lower()
+    key = _TAG_SYNTAX_ALIASES.get(key, key)
+    if key not in _TAG_PATTERNS:
+        raise ValueError(f"Unknown tag_syntax {tag_syntax!r}. Accepted: {', '.join(_TAG_PATTERNS)}")
+    return re.compile(_TAG_PATTERNS[key], 0 if case_sensitive else re.IGNORECASE)
+
+
+def _speaker_of(match) -> int:
+    """Speaker index from a tag match, whichever alternative fired."""
+    for name in ("spk1", "spk2", "spk3"):
+        value = match.groupdict().get(name)
+        if value is not None:
+            return int(value)
+    raise ValueError(f"tag pattern matched {match.group(0)!r} without capturing a speaker index")
