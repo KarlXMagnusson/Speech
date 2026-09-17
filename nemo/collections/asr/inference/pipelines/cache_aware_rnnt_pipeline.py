@@ -364,7 +364,7 @@ class CacheAwareRNNTPipeline(BasePipeline):
         if eou_detected and state.hyp_decoding_state is not None:
             beam_idx = state.select_best_beam_idx_(score_norm=True, length_norm_power=self.length_norm_power)
             self.beam_decoder_computer.select_beam_in_state_item_(state.hyp_decoding_state, beam_idx)
-            state.set_beam_score_baseline_()
+            state.reset_beam_score_()
         state.update_(eou_detected)
 
         if self._lang_tag_filtering_enabled() and state.tokens:
