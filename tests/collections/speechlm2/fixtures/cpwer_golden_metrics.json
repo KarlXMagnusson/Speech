@@ -1,0 +1,63 @@
+{
+ "cpwer": 96.93,
+ "cpwer_abstained": 3,
+ "cpwer_admitted": 49,
+ "cpwer_axes": {
+  "deviations": [],
+  "non_axis": "placement='prefix',max_speakers=None",
+  "resolved": "cpwer_ceiling_source='strip_tags',cpwer_drop_tag_residue=False,cpwer_keep_empty_streams=False,cpwer_normalizer='chime8',cpwer_speaker_order='first_seen',cpwer_tag_case_sensitive=False,cpwer_tag_syntax_hyp='canonical',cpwer_tag_syntax_ref='spk',cpwer_untagged_speaker_hyp=0,cpwer_untagged_speaker_ref=None",
+  "verdict": "yes (9 of 9 comparable axes; cpwer_ceiling_source excluded)"
+ },
+ "cpwer_deletions": 138,
+ "cpwer_empty_hyp": 0,
+ "cpwer_errors": 410,
+ "cpwer_fraction": 0.9692671394799054,
+ "cpwer_insertions": 92,
+ "cpwer_macro": 117.83,
+ "cpwer_macro_fraction": 1.1783054477026802,
+ "cpwer_notag_ceiling": 94.56,
+ "cpwer_notag_ceiling_fraction": 0.9456264775413712,
+ "cpwer_per_subset": {
+  "set-a": {
+   "cpwer": 95.49,
+   "cpwer_errors": 127,
+   "cpwer_fraction": 0.9548872180451128,
+   "cpwer_macro": 131.59,
+   "cpwer_macro_fraction": 1.3159162109820004,
+   "cpwer_notag_ceiling": 99.25,
+   "cpwer_notag_ceiling_fraction": 0.9924812030075187,
+   "cpwer_ref_words": 133,
+   "cpwer_sessions": 17
+  },
+  "set-b": {
+   "cpwer": 102.46,
+   "cpwer_errors": 125,
+   "cpwer_fraction": 1.0245901639344261,
+   "cpwer_macro": 128.38,
+   "cpwer_macro_fraction": 1.2838082941024116,
+   "cpwer_notag_ceiling": 91.8,
+   "cpwer_notag_ceiling_fraction": 0.9180327868852459,
+   "cpwer_ref_words": 122,
+   "cpwer_sessions": 16
+  },
+  "set-c": {
+   "cpwer": 96.21,
+   "cpwer_errors": 127,
+   "cpwer_fraction": 0.9621212121212122,
+   "cpwer_macro": 98.89,
+   "cpwer_macro_fraction": 0.9888583638583639,
+   "cpwer_notag_ceiling": 87.88,
+   "cpwer_notag_ceiling_fraction": 0.8787878787878788,
+   "cpwer_ref_words": 132,
+   "cpwer_sessions": 16
+  }
+ },
+ "cpwer_ref_words": 423,
+ "cpwer_rows_without_subset": 3,
+ "cpwer_sessions": 52,
+ "cpwer_subset_macro": 98.05,
+ "cpwer_substitutions": 180,
+ "cpwer_untagged_hyp_sessions": 9,
+ "cpwer_zero_ref_words": 0,
+ "scale": "percent"
+}

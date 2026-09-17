@@ -64,7 +64,7 @@ from nemo.collections.asr.parts.utils.text_normalizers import build_normalizer
 from nemo.collections.common.data.lhotse.cutset import guess_parse_cutset
 from nemo.collections.common.data.lhotse.dataloader import pad_extra_duration
 from nemo.collections.speechlm2.models import StreamingSTTModel
-from nemo.collections.speechlm2.parts.metrics import CpWER, CpWERSessionResult
+from nemo.collections.speechlm2.parts.metrics import CpWER, CpWERScoringConfig, CpWERSessionResult
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
 
@@ -170,7 +170,17 @@ class StreamingSTTGenerationConfig:
 
 
 @dataclass
-class StreamingSTTEvalConfig:
+class StreamingSTTEvalConfig(CpWERScoringConfig):
+    """Inference settings, composed with the scoring settings shared with the offline scorer.
+
+    `CpWERScoringConfig` is a MIXIN, not a metric-specific base: an eval config *has* scoring
+    settings rather than being a kind of cpWER config, and a second metric must be able to
+    contribute its own fields beside these. Its fields -- `compute_cpwer`, `use_normalizer`,
+    `normalizer_language`, the ten cpWER axes, `cpwer_placement`, `cpwer_max_speakers`,
+    `cpwer_report_notag_ceiling`, `subset_field` -- are defined once there so the two entry points
+    cannot drift. Inherited fields sort first in `--cfg job`, which is the one cosmetic cost.
+    """
+
     pretrained_name: str = ""
     inputs: str = ""
     batch_size: int = 64
@@ -181,17 +191,6 @@ class StreamingSTTEvalConfig:
     verbose: bool = True
     device: str = "cuda"
     dtype: str = "bfloat16"
-    # Normalizer FAMILY; `normalizer_language` selects within it (see
-    # nemo/collections/asr/parts/utils/text_normalizers.py).
-    #   "whisper": Whisper's own -- English gets EnglishTextNormalizer, other languages Basic.
-    #   "hf":      the Open ASR Leaderboard fork of it, which additionally collapses acronyms
-    #              ("b b c" -> "bbc"), normalizes names and rewrites compounds ("wi fi" -> "wifi").
-    #              Required to reproduce leaderboard WER.
-    #   "none":    no normalization.
-    # An unrecognised name RAISES -- it used to mean "none", so a typo silently reported
-    # un-normalized numbers.
-    use_normalizer: Optional[str] = "whisper"
-    normalizer_language: str = "en"  # applies to "whisper" and "hf" alike; non-"en" needs `num2words`
     use_offline_embs: bool = False
     seed: Optional[int] = None  # Set for deterministic results
     pad_extra_duration: Optional[float] = 0.0
@@ -228,22 +227,9 @@ class StreamingSTTEvalConfig:
     #   [{"text": "...", "start_time": float_s, "end_time": float_s}, ...]
     save_alignments: bool = True
     # --- multi-speaker (SOT) scoring ---
-    # cpWER is permutation-invariant over speakers, so it scores transcription AND attribution.
-    # On a tagless corpus it degenerates to per-session WER, which makes its micro aggregate a free
-    # cross-check against the corpus WER above.
-    compute_cpwer: bool = True
-    # Bucket for words with no preceding <spk:N> tag -- the whole hypothesis, for the control arm.
-    # None drops them, which turns them into silent deletions; do not use.
-    cpwer_untagged_speaker: Optional[int] = 0
-    # Fold tag indices >= N into one bucket instead of inventing speakers. None = no folding.
-    cpwer_max_speakers: Optional[int] = None
-    # 'suffix' when the model closes a speaker run with `<spk:N>` instead of opening it
-    # (deferred-identity targets). Must match how the checkpoint was trained, or every
-    # word is attributed to the wrong speaker and cpWER is meaningless.
-    cpwer_placement: str = 'prefix'
-    # Also score a word-perfect but tagless pseudo-hypothesis: the score a system that attributes
-    # nothing would get. Makes the control arm's cpWER interpretable.
-    cpwer_report_notag_ceiling: bool = True
+    # Every cpWER setting -- `compute_cpwer`, the ten axes, `cpwer_placement`, `cpwer_max_speakers`,
+    # `cpwer_report_notag_ceiling`, `subset_field` -- is inherited from CpWERScoringConfig, so this
+    # script and the offline scorer cannot disagree about what they mean.
     # Feed ORACLE RTTM speaker targets to the encoder at inference instead of letting a
     # ParallelExpertEncoder run its own streaming diarizer. Separates "does the speaker kernel
     # help" from "is the streaming diarizer good enough" -- a weak infusion result is otherwise
@@ -509,15 +495,8 @@ def main(cfg: StreamingSTTEvalConfig):
 
     cpwer_metric = cpwer_results = None
     if cfg.compute_cpwer:
-        cpwer_metric = CpWER(
-            normalize=True,
-            normalizer=normalizer,
-            untagged_speaker=cfg.cpwer_untagged_speaker,
-            placement=cfg.cpwer_placement,
-            max_speakers=cfg.cpwer_max_speakers,
-            report_notag_ceiling=cfg.cpwer_report_notag_ceiling,
-            verbose=False,
-        )
+        # Same construction path as the offline scorer, so the two cannot drift.
+        cpwer_metric = CpWER.from_config(cfg, normalizer=normalizer)
         # Score per session from the RAW pairs, then aggregate. Same hypotheses as the WER above.
         cpwer_results = {r.id: cpwer_metric.score_session(r.ref_raw, r.hyp_raw) for r in reduced}
         cpwer_metric.update("corpus", [r.ref_raw for r in reduced], [r.hyp_raw for r in reduced])

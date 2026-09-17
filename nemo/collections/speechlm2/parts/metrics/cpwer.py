@@ -119,6 +119,44 @@ class CpWER:
         # 'suffix' when targets close a run with `<spk:N>` instead of opening it.
         self.placement = placement
 
+    @classmethod
+    def from_config(cls, cfg, normalizer=None) -> "CpWER":
+        """Build from a ``CpWERScoringConfig``, so every entry point configures this the same way.
+
+        Naming the axes at each call site instead would let an inference script and an offline
+        scorer drift apart silently -- which is the one failure this whole surface exists to avoid.
+
+        Args:
+            cfg: any object carrying the ``CpWERScoringConfig`` fields.
+            normalizer: pre-built callable; when omitted it is built from the config's resolved
+                normalizer family.
+
+        Returns:
+            CpWER: configured, with counters reset.
+        """
+        if normalizer is None:
+            from nemo.collections.asr.parts.utils.text_normalizers import build_normalizer
+
+            normalizer = build_normalizer(cfg.effective_normalizer(), cfg.normalizer_language)
+        return cls(
+            normalize=True,
+            normalizer=normalizer,
+            untagged_speaker=cfg.cpwer_untagged_speaker_ref,
+            max_speakers=cfg.cpwer_max_speakers,
+            report_notag_ceiling=cfg.cpwer_report_notag_ceiling,
+            verbose=False,
+            placement=cfg.cpwer_placement,
+            tag_syntax_ref=cfg.cpwer_tag_syntax_ref,
+            tag_syntax_hyp=cfg.cpwer_tag_syntax_hyp,
+            tag_case_sensitive=cfg.cpwer_tag_case_sensitive,
+            untagged_speaker_ref=cfg.cpwer_untagged_speaker_ref,
+            untagged_speaker_hyp=cfg.cpwer_untagged_speaker_hyp,
+            keep_empty_streams=cfg.cpwer_keep_empty_streams,
+            drop_tag_residue=cfg.cpwer_drop_tag_residue,
+            speaker_order=cfg.cpwer_speaker_order,
+            ceiling_source=cfg.cpwer_ceiling_source,
+        )
+
     def reset(self):
         """Drop all accumulated sessions."""
         self._errors = defaultdict(int)

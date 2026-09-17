@@ -1,0 +1,27 @@
+{
+ "axes": {
+  "compute_cpwer": true,
+  "cpwer_ceiling_source": "strip_tags",
+  "cpwer_drop_tag_residue": false,
+  "cpwer_keep_empty_streams": false,
+  "cpwer_max_speakers": null,
+  "cpwer_normalizer": "chime8",
+  "cpwer_placement": "prefix",
+  "cpwer_report_notag_ceiling": true,
+  "cpwer_speaker_order": "first_seen",
+  "cpwer_tag_case_sensitive": false,
+  "cpwer_tag_syntax_hyp": "canonical",
+  "cpwer_tag_syntax_ref": "spk",
+  "cpwer_untagged_speaker_hyp": 0,
+  "cpwer_untagged_speaker_ref": null,
+  "normalizer_language": "en",
+  "subset_field": "subset_for_metrics",
+  "use_normalizer": "whisper"
+ },
+ "cases": 52,
+ "chime8_english_spelling_sha256": "cedbc325b3d3b2cc8b09919b83c1b046625f1b3027d4cb9bc8f7bf614a7a4872",
+ "chime8_pre_english_spelling_sha256": "2dfc6b88d24f654e02f11e7806e24da23543d76181fbc6a991197a103d11a4b6",
+ "kaldialign": "0.9.3",
+ "python": "3.13.11",
+ "scipy": "1.17.1"
+}

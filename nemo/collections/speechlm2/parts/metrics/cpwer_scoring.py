@@ -242,26 +242,7 @@ def join_reference_manifest(rows: list, ref_rows: list, *, on: str = "id") -> li
 
 
 def _build_metric(cfg: CpWERScoringConfig) -> CpWER:
-    from nemo.collections.asr.parts.utils.text_normalizers import build_normalizer
-
-    return CpWER(
-        normalize=True,
-        normalizer=build_normalizer(cfg.effective_normalizer(), cfg.normalizer_language),
-        untagged_speaker=cfg.cpwer_untagged_speaker_ref,
-        max_speakers=cfg.cpwer_max_speakers,
-        report_notag_ceiling=cfg.cpwer_report_notag_ceiling,
-        verbose=False,
-        placement=cfg.cpwer_placement,
-        tag_syntax_ref=cfg.cpwer_tag_syntax_ref,
-        tag_syntax_hyp=cfg.cpwer_tag_syntax_hyp,
-        tag_case_sensitive=cfg.cpwer_tag_case_sensitive,
-        untagged_speaker_ref=cfg.cpwer_untagged_speaker_ref,
-        untagged_speaker_hyp=cfg.cpwer_untagged_speaker_hyp,
-        keep_empty_streams=cfg.cpwer_keep_empty_streams,
-        drop_tag_residue=cfg.cpwer_drop_tag_residue,
-        speaker_order=cfg.cpwer_speaker_order,
-        ceiling_source=cfg.cpwer_ceiling_source,
-    )
+    return CpWER.from_config(cfg)
 
 
 def _row_metrics(result) -> dict:
