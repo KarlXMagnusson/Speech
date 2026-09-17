@@ -150,9 +150,12 @@ class CacheAwareRNNTBeamStreamingState(CacheAwareRNNTStreamingState):
         +/-inf on long audio with LM shallow fusion.)
 
         ``length_norm_power`` is the exponent on the length term, i.e.
-        ``score / (length + 1) ** length_norm_power``. ``1.0`` is the plain average above; ``0.0``
-        disables length normalization entirely (raw score) -- this is unsafe with LM fusion, since an
-        unnormalized RNNT+LM score can favor near-empty hypotheses.
+        ``score / ((5 + length) / 6) ** length_norm_power`` -- the GNMT-style length penalty (Wu et
+        al., 2016) rather than a plain average. The ``5``/``6`` constants keep the penalty close to
+        ``1.0`` for short hypotheses (where ``length + 1`` over- normalizes) while still approaching
+        a plain length average as ``length`` grows. ``0.0`` disables length normalization entirely
+        (raw score) -- this is unsafe with LM fusion, since an unnormalized RNNT+LM score can favor
+        near-empty hypotheses.
         """
         if self.hyp_decoding_state is None:
             raise RuntimeError("Cannot select beam without decoding carry.")
@@ -160,7 +163,7 @@ class CacheAwareRNNTBeamStreamingState(CacheAwareRNNTStreamingState):
         scores = self.hyp_decoding_state.score
         lengths_nb = self.hyp_decoding_state.current_lengths_nb
         if score_norm:
-            denom = (lengths_nb.to(dtype=scores.dtype) + 1) ** length_norm_power
+            denom = ((5 + lengths_nb.to(dtype=scores.dtype)) / 6) ** length_norm_power
             ranking = scores / denom
         else:
             ranking = scores
