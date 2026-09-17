@@ -15,6 +15,14 @@ from .asr_bleu import ASRBLEU
 from .asr_cer_wer import Intelligibility
 from .bleu import BLEU
 from .cpwer import CpWER, CpWERSessionResult
+from .cpwer_scoring import (
+    AXIS_FIELDS,
+    NON_AXIS_FIELDS,
+    CpWERScoringConfig,
+    join_reference_manifest,
+    resolve_text_fields,
+    score_rows,
+)
 from .perplexity import Perplexity, ValidationLoss
 from .results_logger import ResultsLogger
 from .token_accuracy import TokenAccuracy
@@ -31,6 +39,12 @@ __all__ = [
     'WER',
     'CpWER',
     'CpWERSessionResult',
+    'CpWERScoringConfig',
+    'AXIS_FIELDS',
+    'NON_AXIS_FIELDS',
+    'score_rows',
+    'resolve_text_fields',
+    'join_reference_manifest',
     'TokenAccuracy',
     'ResultsLogger',
     'Intelligibility',

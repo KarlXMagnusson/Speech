@@ -137,11 +137,33 @@ def test_empty_speaker_buckets_survive_normalization():
 def test_empty_reference_is_excluded_not_infinite():
     """One inf session would poison every corpus aggregate."""
     metric = CpWER(normalize=False, verbose=False)
-    assert metric.score_session("", "<spk:0> hello").cpwer is None
+    result = metric.score_session("", "<spk:0> hello")
+    assert result.cpwer is None
+    assert result.abstained, "a reference with no streams is not scored at all"
     metric.update("val", ["", "<spk:0> a b"], ["<spk:0> hello", "<spk:0> a b"])
     out = metric.compute()
     assert out["cpwer_val"] == 0.0, "the empty-reference session should not affect the aggregate"
-    assert out["cpwer_skipped_empty_ref_val"] == 1
+    # Renamed from `cpwer_skipped_empty_ref_val` and widened: it now covers every abstain reason,
+    # not only an empty reference.
+    assert out["cpwer_abstained_val"] == 1
+    assert out["cpwer_admitted_val"] == 1
+    assert out["cpwer_sessions_val"] == 2
+
+
+@pytest.mark.unit
+def test_abstained_is_distinct_from_zero_reference_words():
+    """Two different things that both leave `cpwer` None, counted separately.
+
+    An abstain is not scored at all. A reference that parses into streams but normalizes to zero
+    words IS scored -- its errors pool into the micro numerator against a zero denominator, which
+    is what lets micro exceed 100%.
+    """
+    metric = CpWER(normalize=True, normalizer=lambda s: "", verbose=False)
+    metric.update("val", ["<spk:0> hello"], ["<spk:0> world"])
+    out = metric.compute()
+    assert out["cpwer_abstained_val"] == 0
+    assert out["cpwer_zero_ref_words_val"] == 1
+    assert out["cpwer_admitted_val"] == 1
 
 
 @pytest.mark.unit

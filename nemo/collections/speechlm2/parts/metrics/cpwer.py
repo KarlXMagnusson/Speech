@@ -12,14 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Concatenated minimum-permutation WER for SOT-tagged multi-speaker transcripts."""
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from typing import NamedTuple, Optional
 
 from whisper_normalizer.english import EnglishTextNormalizer
 
 from nemo.collections.asr.metrics.cpwer import calculate_session_cpWER_detail
 from nemo.collections.asr.parts.utils.sot_speaker_alignment import remove_speaker_tags, sot_to_speaker_texts
+from nemo.collections.asr.parts.utils.text_normalizers import build_normalizer
 from nemo.utils import logging
+
+# Distinguishes "caller did not pass this" from "caller passed None", which is a meaningful value
+# for the untagged-speaker axes: None means DISCARD the untagged run.
+_UNSET = object()
 
 
 class CpWERSessionResult(NamedTuple):
@@ -37,6 +42,14 @@ class CpWERSessionResult(NamedTuple):
     hyp_in_ref_order: list
     assignment: list
     notag_ceiling: Optional[float]
+    # True when the row was not scored at all (the reference parsed to zero streams, or the
+    # normalizer failed). Distinct from `cpwer is None`, which also covers a reference that parsed
+    # into streams but normalized to zero words -- that row IS scored and its errors still count.
+    abstained: bool = False
+    # The reference stream keys, parallel to `ref_by_speaker`. Without them a dumped stream list is
+    # positional only, and positions are not comparable across roles once the two are parsed with
+    # different settings.
+    ref_speakers: list = ()
 
 
 class CpWER:
@@ -63,12 +76,42 @@ class CpWER:
         report_notag_ceiling: bool = True,
         verbose: bool = True,
         placement: str = 'prefix',
+        *,
+        normalizer_name: Optional[str] = None,
+        tag_syntax_ref: str = 'spk',
+        tag_syntax_hyp: str = 'spk',
+        tag_case_sensitive: bool = True,
+        untagged_speaker_ref: Optional[int] = _UNSET,
+        untagged_speaker_hyp: Optional[int] = _UNSET,
+        keep_empty_streams: bool = True,
+        drop_tag_residue: bool = True,
+        speaker_order: str = 'index',
+        ceiling_source: str = 'strip_tags',
     ):
-        if normalize:
+        if normalizer is not None and normalizer_name is not None:
+            raise ValueError("Pass either normalizer= (a callable) or normalizer_name= (a family name), not both.")
+        if normalizer_name is not None:
+            self.normalizer = build_normalizer(normalizer_name, 'en')
+        elif normalize:
             self.normalizer = normalizer if normalizer is not None else EnglishTextNormalizer()
         else:
             self.normalizer = _identity
+        _validate('placement', placement, ('prefix', 'suffix'))
+        _validate('speaker_order', speaker_order, ('index', 'first_seen'))
+        _validate('ceiling_source', ceiling_source, ('strip_tags', 'streams'))
         self.untagged_speaker = untagged_speaker
+        # Per-role, because a reference and a hypothesis are not symmetric: some scorers discard a
+        # reference run that precedes the first tag while keeping the hypothesis equivalent. Each
+        # falls back to the single `untagged_speaker` when not given, so old call sites are unchanged.
+        self.untagged_speaker_ref = untagged_speaker if untagged_speaker_ref is _UNSET else untagged_speaker_ref
+        self.untagged_speaker_hyp = untagged_speaker if untagged_speaker_hyp is _UNSET else untagged_speaker_hyp
+        self.tag_syntax_ref = tag_syntax_ref
+        self.tag_syntax_hyp = tag_syntax_hyp
+        self.tag_case_sensitive = tag_case_sensitive
+        self.keep_empty_streams = keep_empty_streams
+        self.drop_tag_residue = drop_tag_residue
+        self.speaker_order = speaker_order
+        self.ceiling_source = ceiling_source
         self.max_speakers = max_speakers
         self.report_notag_ceiling = report_notag_ceiling
         self.verbose = verbose
@@ -83,26 +126,69 @@ class CpWER:
         self._rates = defaultdict(list)
         self._by_num_speakers = defaultdict(lambda: [0, 0])
         self._ceiling = defaultdict(lambda: [0, 0])
-        self._skipped_empty_ref = defaultdict(int)
+        self._ins = defaultdict(int)
+        self._dels = defaultdict(int)
+        self._subs = defaultdict(int)
+        self._abstained = defaultdict(int)
+        self._zero_ref_words = defaultdict(int)
+        self._admitted = defaultdict(int)
+        self._empty_hyp = defaultdict(int)
         self._untagged_hyp = defaultdict(int)
         self._sessions = defaultdict(int)
         return self
 
-    def _speaker_lists(self, text: str) -> list:
-        """Tagged text -> one normalized string per speaker, ascending by speaker index."""
+    def _speaker_streams(self, text: str, role: str) -> "OrderedDict":
+        """Tagged text -> ``{speaker index: normalized text}`` for one role.
+
+        Returns the keys, not just the values, because a caller that dumps streams for inspection
+        needs to know WHICH speaker each string belongs to -- and because the two roles can be
+        parsed with different settings, so positions are not comparable across them.
+
+        Args:
+            text: raw, still-tagged text.
+            role: ``'ref'`` or ``'hyp'``; selects the per-role axes.
+
+        Returns:
+            OrderedDict[int, str]: speaker index -> normalized text, in `speaker_order`.
+        """
         grouped = sot_to_speaker_texts(
             text,
-            default_speaker=self.untagged_speaker,
-            keep_empty=True,
+            default_speaker=self.untagged_speaker_ref if role == 'ref' else self.untagged_speaker_hyp,
+            keep_empty=self.keep_empty_streams,
             max_speakers=self.max_speakers,
             placement=self.placement,
+            tag_syntax=self.tag_syntax_ref if role == 'ref' else self.tag_syntax_hyp,
+            case_sensitive=self.tag_case_sensitive,
+            drop_tag_residue=self.drop_tag_residue,
+            speaker_order=self.speaker_order,
         )
-        return [self.normalizer(t).strip() for t in grouped.values()]
+        return OrderedDict((i, self.normalizer(t).strip()) for i, t in grouped.items())
 
     def score_session(self, ref_raw: str, hyp_raw: str) -> CpWERSessionResult:
         """Score one session from RAW (still tagged) reference and hypothesis strings."""
-        ref_list = self._speaker_lists(ref_raw)
-        hyp_list = self._speaker_lists(hyp_raw)
+        ref_streams = self._speaker_streams(ref_raw, 'ref')
+        hyp_streams = self._speaker_streams(hyp_raw, 'hyp')
+        ref_list = list(ref_streams.values())
+        hyp_list = list(hyp_streams.values())
+        if not ref_streams:
+            # The reference parsed to zero streams -- nothing to score against. Abstain rather than
+            # invent a single empty speaker, which would turn every hypothesis word into an
+            # insertion against a zero denominator.
+            return CpWERSessionResult(
+                cpwer=None,
+                errors=0,
+                ref_words=0,
+                ins=0,
+                dels=0,
+                subs=0,
+                num_ref_speakers=0,
+                num_hyp_speakers=len(hyp_list),
+                ref_by_speaker=[],
+                hyp_in_ref_order=[],
+                assignment=[],
+                notag_ceiling=None,
+                abstained=True,
+            )
         detail = calculate_session_cpWER_detail(hyp_list, ref_list)
 
         ceiling = None
@@ -110,7 +196,25 @@ class CpWER:
             # A word-perfect but completely untagged hypothesis. Reference-only and model
             # independent, with the same denominator -- so it is the ceiling a system that
             # attributes nothing would score, and makes the control arm's number interpretable.
-            flat = self.normalizer(remove_speaker_tags(ref_raw)).strip()
+            if self.ceiling_source == 'streams':
+                # `remove_speaker_tags` only knows `<spk:N>`, so under any other tag syntax the tag
+                # text would leak into the pseudo-hypothesis and be scored as words. Joining the
+                # parser's own RAW streams and normalizing once avoids that. Join raw, normalize
+                # once -- normalizing each stream and joining is not the same string.
+                raw = sot_to_speaker_texts(
+                    ref_raw,
+                    default_speaker=self.untagged_speaker_ref,
+                    keep_empty=False,
+                    max_speakers=self.max_speakers,
+                    placement=self.placement,
+                    tag_syntax=self.tag_syntax_ref,
+                    case_sensitive=self.tag_case_sensitive,
+                    drop_tag_residue=self.drop_tag_residue,
+                    speaker_order=self.speaker_order,
+                )
+                flat = self.normalizer(" ".join(raw.values())).strip()
+            else:
+                flat = self.normalizer(remove_speaker_tags(ref_raw)).strip()
             ceiling = calculate_session_cpWER_detail([flat], ref_list).cpwer
 
         return CpWERSessionResult(
@@ -126,19 +230,46 @@ class CpWER:
             hyp_in_ref_order=detail.hyp_in_ref_order,
             assignment=detail.assignment,
             notag_ceiling=ceiling,
+            ref_speakers=list(ref_streams.keys()),
         )
 
     def update(self, name: str, refs: list, hyps: list) -> None:
-        """Accumulate a batch of raw tagged reference/hypothesis pairs under dataset ``name``."""
+        """Accumulate a batch of raw tagged reference/hypothesis pairs under dataset ``name``.
+
+        Args:
+            name: dataset label the counts accumulate under.
+            refs: raw, still-tagged reference strings.
+            hyps: raw, still-tagged hypothesis strings, parallel to ``refs``.
+
+        Raises:
+            ValueError: if the two lists differ in length. ``zip`` used to truncate silently, which
+                scores a prefix of the corpus and reports it as the whole thing.
+        """
+        if len(refs) != len(hyps):
+            raise ValueError(f"refs and hyps must be the same length, got {len(refs)} and {len(hyps)}")
         for ref, hyp in zip(refs, hyps):
             result = self.score_session(ref, hyp)
             self._sessions[name] += 1
-            if result.cpwer is None:
-                # An empty reference yields inf; one such session would poison every aggregate.
-                self._skipped_empty_ref[name] += 1
+            if result.abstained:
+                # Not scored at all: the reference parsed to zero streams, so there is nothing to
+                # align against. Excluded from micro AND macro, and counted so it cannot hide.
+                self._abstained[name] += 1
                 continue
+            if result.cpwer is None:
+                # Parsed into streams but normalized to zero words. The errors are real and still
+                # pool into the micro numerator; the denominator contribution is zero, so this can
+                # push micro above 100%. Counted separately from an abstain.
+                self._zero_ref_words[name] += 1
+            self._admitted[name] += 1
+            if not any(result.hyp_in_ref_order):
+                self._empty_hyp[name] += 1
             self._errors[name] += result.errors
             self._ref_words[name] += result.ref_words
+            self._ins[name] += result.ins
+            self._dels[name] += result.dels
+            self._subs[name] += result.subs
+            if result.cpwer is None:
+                continue
             self._rates[name].append(result.cpwer)
             bucket = self._by_num_speakers[(name, result.num_ref_speakers)]
             bucket[0] += result.errors
@@ -162,11 +293,20 @@ class CpWER:
             out[f"cpwer_macro_{name}"] = (
                 sum(self._rates[name]) / len(self._rates[name]) if self._rates[name] else float("nan")
             )
+            # Integer totals, so a micro can be re-pooled across runs without re-scoring.
+            out[f"cpwer_errors_{name}"] = self._errors[name]
+            out[f"cpwer_ref_words_{name}"] = self._ref_words[name]
+            out[f"cpwer_insertions_{name}"] = self._ins[name]
+            out[f"cpwer_deletions_{name}"] = self._dels[name]
+            out[f"cpwer_substitutions_{name}"] = self._subs[name]
+            # Counters are emitted even at zero. A counter that appears only when non-zero cannot be
+            # distinguished from one that was never computed, which is exactly when it matters.
             out[f"cpwer_sessions_{name}"] = self._sessions[name]
-            if self._skipped_empty_ref[name]:
-                out[f"cpwer_skipped_empty_ref_{name}"] = self._skipped_empty_ref[name]
-            if self._untagged_hyp[name]:
-                out[f"cpwer_untagged_hyp_sessions_{name}"] = self._untagged_hyp[name]
+            out[f"cpwer_admitted_{name}"] = self._admitted[name]
+            out[f"cpwer_abstained_{name}"] = self._abstained[name]
+            out[f"cpwer_zero_ref_words_{name}"] = self._zero_ref_words[name]
+            out[f"cpwer_empty_hyp_{name}"] = self._empty_hyp[name]
+            out[f"cpwer_untagged_hyp_sessions_{name}"] = self._untagged_hyp[name]
             errs, denom = self._ceiling[name]
             if denom:
                 out[f"cpwer_notag_ceiling_{name}"] = errs / denom
@@ -183,3 +323,13 @@ class CpWER:
 
 def _identity(x):
     return x
+
+
+def _validate(name: str, value, accepted) -> None:
+    """Reject an unrecognised axis value instead of silently taking a default branch.
+
+    ``placement='Prefix'`` used to fall through to the prefix branch, so a typo produced a
+    plausible number from the wrong setting.
+    """
+    if value not in accepted:
+        raise ValueError(f"Unknown {name}={value!r}. Accepted: {', '.join(map(repr, accepted))}")
