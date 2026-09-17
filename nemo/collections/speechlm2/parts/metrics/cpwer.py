@@ -256,7 +256,17 @@ class CpWER:
             ceiling = calculate_session_cpWER_detail([flat], ref_list).cpwer
 
         return CpWERSessionResult(
-            cpwer=detail.cpwer if detail.ref_words else None,
+            # The two gates, named separately because they are different situations that both
+            # leave no rate to compute:
+            #   GATE 1  ref_list empty      -> the reference parsed to zero streams. Not scored at
+            #                                  all; handled by the early return above.
+            #   GATE 2  ref_words == 0      -> it parsed into streams that normalize to nothing (a
+            #                                  reference of pure filler). Scored as 0.0: the errors
+            #                                  still pool into the micro numerator against a zero
+            #                                  denominator contribution, so micro can exceed 100%,
+            #                                  and a literal 0.0 joins the macro list. Both follow
+            #                                  the reference scorer; agreement is the point.
+            cpwer=detail.cpwer if detail.ref_words else 0.0,
             errors=detail.errors,
             ref_words=detail.ref_words,
             ins=detail.ins,
@@ -293,10 +303,10 @@ class CpWER:
                 # align against. Excluded from micro AND macro, and counted so it cannot hide.
                 self._abstained[name] += 1
                 continue
-            if result.cpwer is None:
-                # Parsed into streams but normalized to zero words. The errors are real and still
-                # pool into the micro numerator; the denominator contribution is zero, so this can
-                # push micro above 100%. Counted separately from an abstain.
+            if not result.ref_words:
+                # GATE 2: parsed into streams but normalized to zero words. The errors are real and
+                # still pool into the micro numerator; the denominator contribution is zero, so this
+                # can push micro above 100%. Counted separately from an abstain.
                 self._zero_ref_words[name] += 1
             self._admitted[name] += 1
             if not any(result.hyp_in_ref_order):
@@ -306,8 +316,7 @@ class CpWER:
             self._ins[name] += result.ins
             self._dels[name] += result.dels
             self._subs[name] += result.subs
-            if result.cpwer is None:
-                continue
+            # A gate-2 row contributes a literal 0.0 here, which is what dilutes the macro.
             self._rates[name].append(result.cpwer)
             bucket = self._by_num_speakers[(name, result.num_ref_speakers)]
             bucket[0] += result.errors

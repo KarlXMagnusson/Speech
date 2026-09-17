@@ -215,3 +215,62 @@ def test_suffix_placement_orphans_an_unclosed_trailing_run():
     assert sot_to_speaker_texts("how are you <spk:1> i am fine", placement='suffix', default_speaker=None) == {
         1: "how are you"
     }
+
+
+@pytest.mark.unit
+def test_zero_ref_words_is_scored_as_zero():
+    """GATE 2: a reference that parses into streams but normalizes to no words scores 0.0.
+
+    Not None, and not an abstain. The row IS scored: its errors pool into the micro numerator
+    against a zero denominator contribution -- which is what lets micro exceed 100% -- and a literal
+    0.0 joins the macro list, pulling the macro down. Both are deliberate, so that this agrees with
+    the reference scorer rather than being independently defensible.
+
+    Distinct from GATE 1 (the reference parses to zero streams), which is not scored at all.
+    """
+    # The real case: a reference of pure filler. The normalizer erases "mm" and keeps the
+    # hypothesis, so the reference has no words while the hypothesis has two.
+    metric = CpWER(normalize=True, verbose=False)
+
+    result = metric.score_session("<spk:0> mm", "<spk:0> hello world")
+    assert result.cpwer == 0.0, "gate 2 scores 0.0, not None"
+    assert not result.abstained, "gate 2 is scored; only gate 1 abstains"
+    assert result.ref_words == 0
+    assert result.errors == 2, "the hypothesis words are real insertions"
+
+    # One clean session plus one gate-2 session.
+    metric.update("val", ["<spk:0> a b", "<spk:0> mm"], ["<spk:0> a b", "<spk:0> hello world"])
+    out = metric.compute()
+    assert out["cpwer_zero_ref_words_val"] == 1
+    assert out["cpwer_abstained_val"] == 0
+    assert out["cpwer_admitted_val"] == 2
+    # Micro: 2 errors over 2 reference words -- the gate-2 row contributed errors but no denominator,
+    # which is exactly how micro can exceed 100%.
+    assert out["cpwer_errors_val"] == 2 and out["cpwer_ref_words_val"] == 2
+    assert out["cpwer_val"] == 1.0
+    # Macro: mean(0.0 from the clean session, 0.0 from the gate-2 row) -- the spurious 0.0 is in.
+    assert out["cpwer_macro_val"] == 0.0
+    assert len(out) and out["cpwer_sessions_val"] == 2
+
+
+@pytest.mark.unit
+def test_gate_two_row_shape_stays_distinct_from_an_abstain():
+    """Same "no rate", two situations -- a reader must be able to tell them apart by key presence."""
+    from nemo.collections.speechlm2.parts.metrics.cpwer_scoring import CpWERScoringConfig, score_rows
+
+    counts = ("cpwer_errors", "cpwer_ref_words", "cpwer_insertions", "cpwer_deletions", "cpwer_substitutions")
+
+    # Gate 2: parses into one stream that normalizes empty -> scored, all five counts, cpwer 0.0.
+    gate2 = score_rows(
+        [{"text_raw": "<spk:0> mm", "pred_text_raw": "<spk:0> hello"}],
+        CpWERScoringConfig(use_normalizer="none", cpwer_normalizer="none"),
+    )[0][0]
+
+    # Gate 1: no tag at all, under a config that discards untagged reference text -> zero streams.
+    gate1 = score_rows(
+        [{"text_raw": "no tags here", "pred_text_raw": "<spk:0> hello"}],
+        CpWERScoringConfig(cpwer_untagged_speaker_ref=None),
+    )[0][0]
+
+    assert gate1["cpwer"] is None and all(k not in gate1 for k in counts)
+    assert gate2["cpwer"] is not None and all(k in gate2 for k in counts)
