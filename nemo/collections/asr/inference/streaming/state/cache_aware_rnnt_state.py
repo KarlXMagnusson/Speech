@@ -179,8 +179,12 @@ class CacheAwareRNNTBeamStreamingState(CacheAwareRNNTStreamingState):
         """
         if self.hyp_decoding_state is None:
             return
+        # `select_beam_in_state_item_` builds these tensors inside `torch.inference_mode()`, so an
+        # in-place write here (outside that context) needs a clone first.
+        self.hyp_decoding_state.score = self.hyp_decoding_state.score.clone()
         self.hyp_decoding_state.score[0] = 0.0
         if self.hyp_decoding_state.current_lengths_nb is not None:
+            self.hyp_decoding_state.current_lengths_nb = self.hyp_decoding_state.current_lengths_nb.clone()
             self.hyp_decoding_state.current_lengths_nb[0] = 0
 
     def get_best_hyp_idx(self) -> int:

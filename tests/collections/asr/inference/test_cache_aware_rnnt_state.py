@@ -108,3 +108,16 @@ class TestResetBeamScore:
     def test_reset_without_decoding_carry_is_a_noop(self):
         state = CacheAwareRNNTBeamStreamingState()
         state.reset_beam_score_()  # must not raise
+
+    @pytest.mark.unit
+    def test_reset_clones_inference_mode_tensors(self):
+        # select_beam_in_state_item_ builds score/current_lengths_nb inside torch.inference_mode();
+        # an in-place write to those tensors outside that context must not raise.
+        with torch.inference_mode():
+            score = torch.tensor([-12000.0, -float("inf")])
+            length = torch.tensor([30000.0, 30000.0])
+        state = CacheAwareRNNTBeamStreamingState()
+        state.hyp_decoding_state = SimpleNamespace(score=score, current_lengths_nb=length)
+        state.reset_beam_score_()  # must not raise
+        assert state.hyp_decoding_state.score[0].item() == 0.0
+        assert state.hyp_decoding_state.current_lengths_nb[0].item() == 0.0
