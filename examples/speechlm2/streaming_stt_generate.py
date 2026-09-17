@@ -40,6 +40,7 @@ The model's ``generate()`` method returns ``list[str]`` directly.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import subprocess
@@ -65,6 +66,7 @@ from nemo.collections.common.data.lhotse.cutset import guess_parse_cutset
 from nemo.collections.common.data.lhotse.dataloader import pad_extra_duration
 from nemo.collections.speechlm2.models import StreamingSTTModel
 from nemo.collections.speechlm2.parts.metrics import CpWER, CpWERScoringConfig, CpWERSessionResult
+from nemo.collections.speechlm2.parts.metrics.cpwer_report import cpwer_metrics_dict, format_cpwer_report
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
 
@@ -227,6 +229,11 @@ class StreamingSTTEvalConfig(CpWERScoringConfig):
     #   [{"text": "...", "start_time": float_s, "end_time": float_s}, ...]
     save_alignments: bool = True
     # --- multi-speaker (SOT) scoring ---
+    # Score cpWER during inference. `false` still writes the full manifest -- raw fields, `_run`,
+    # WER, everything -- it only skips the cpWER block, which `streaming_stt_score.py` can then
+    # produce offline from that manifest. Useful when the GPU box should not also be deciding how
+    # scoring works.
+    score_inline: bool = True
     # Every cpWER setting -- `compute_cpwer`, the ten axes, `cpwer_placement`, `cpwer_max_speakers`,
     # `cpwer_report_notag_ceiling`, `subset_field` -- is inherited from CpWERScoringConfig, so this
     # script and the offline scorer cannot disagree about what they mean.
@@ -302,7 +309,10 @@ def main(cfg: StreamingSTTEvalConfig):
             "match. Set use_state_machine_inference=false."
         )
 
-    if seg_mode and cfg.compute_cpwer:
+    # Gated, not deleted. Segmented inference may now WRITE a manifest, since scoring can happen
+    # later; what is still impossible is scoring cpWER over it, here or offline. The scorer raises
+    # the same message from `_run.seg_mode`.
+    if seg_mode and cfg.compute_cpwer and cfg.score_inline:
         raise ValueError(
             "cpWER requires globally consistent speaker indices, but <spk:N> is arrival-ordered "
             "WITHIN each decode window -- segments are decoded independently, so <spk:0> in one "
@@ -493,33 +503,45 @@ def main(cfg: StreamingSTTEvalConfig):
     hyps = [normalizer(remove_speaker_tags(r.hyp_raw)) for r in reduced]
     wer, _, nins, ndel, nsub = word_error_rate_detail(hypotheses=hyps, references=refs, use_cer=False)
 
-    cpwer_metric = cpwer_results = None
-    if cfg.compute_cpwer:
-        # Same construction path as the offline scorer, so the two cannot drift.
+    cpwer_results = cpwer_metrics = None
+    cpwer_report = ""
+    if cfg.compute_cpwer and cfg.score_inline:
+        # Solve each session ONCE and feed the result to both the per-row dump and the accumulator.
+        # Scoring per session and then calling update() re-solved every session, four Hungarian
+        # solves per session with the ceiling on.
         cpwer_metric = CpWER.from_config(cfg, normalizer=normalizer)
-        # Score per session from the RAW pairs, then aggregate. Same hypotheses as the WER above.
-        cpwer_results = {r.id: cpwer_metric.score_session(r.ref_raw, r.hyp_raw) for r in reduced}
+        cpwer_results = {}
+        for rec in reduced:
+            cpwer_results[rec.id] = cpwer_metric.score_session(rec.ref_raw, rec.hyp_raw)
         cpwer_metric.update("corpus", [r.ref_raw for r in reduced], [r.hyp_raw for r in reduced])
-        cpwer_summary = cpwer_metric.compute()
+        corpus_summary = cpwer_metric.compute()
+
+        # Per-subset buckets, keyed off the input manifest row carried in `meta`.
+        subset_metric = CpWER.from_config(cfg, normalizer=normalizer)
+        subsets_seen = set()
+        for rec in reduced:
+            subset = (rec.meta.get("custom") or {}).get(cfg.subset_field) or rec.meta.get(cfg.subset_field)
+            if subset:
+                subset_metric.update(str(subset), [rec.ref_raw], [rec.hyp_raw])
+                subsets_seen.add(str(subset))
+        subset_summary = subset_metric.compute()
+        subsets = {
+            name: {k: v for k, v in subset_summary.items() if k.endswith(f"_{name}")} for name in sorted(subsets_seen)
+        }
+        cpwer_metrics = cpwer_metrics_dict(corpus_summary, subsets, cfg)
+        # The same renderer the offline scorer uses, so the two blocks cannot drift.
+        cpwer_report = format_cpwer_report(cpwer_metrics, cfg, wer=wer)
+
     rtfx = sum(input_durations) / sum(infer_durations)
     logging.info(f"WER: {wer:.2%} [ins={nins:.2%} del={ndel:.2%} sub={nsub:.2%}]")
+    # RTFx lives only here: it measures inference and cannot be recomputed offline, which also makes
+    # it the visual tell between a block written by this script and one written by the scorer.
     logging.info(f"RTFx: {rtfx:.1f}")
-    cpwer_lines = []
-    if cpwer_results is not None:
-        micro = cpwer_summary.get("cpwer_corpus", float("nan"))
-        cpwer_lines.append(f"cpWER (micro): {micro:.2%}   [attribution gap vs WER: {micro - wer:+.2%}]")
-        cpwer_lines.append(f"cpWER (macro): {cpwer_summary.get('cpwer_macro_corpus', float('nan')):.2%}")
-        if "cpwer_notag_ceiling_corpus" in cpwer_summary:
-            cpwer_lines.append(
-                f"cpWER no-tag ceiling: {cpwer_summary['cpwer_notag_ceiling_corpus']:.2%} "
-                "(a word-perfect but unattributed hypothesis)"
-            )
-        for key in sorted(k for k in cpwer_summary if k.endswith("spk")):
-            cpwer_lines.append(f"  {key.rsplit('_', 1)[-1]:>5s} reference speakers: {cpwer_summary[key]:.2%}")
-        for key in ("cpwer_sessions_corpus", "cpwer_skipped_empty_ref_corpus", "cpwer_untagged_hyp_sessions_corpus"):
-            if key in cpwer_summary:
-                cpwer_lines.append(f"  {key}: {cpwer_summary[key]}")
-        for line in cpwer_lines:
+    if cpwer_report:
+        # One record per line, not one multi-line record: only the first line of a multi-line
+        # message carries the `[NeMo I ...]` prefix, and run scripts grep the log for that prefix
+        # plus a keyword. A single record would silently drop every line but the first.
+        for line in cpwer_report.splitlines():
             logging.info(line)
 
     if cfg.output_manifest is not None:
@@ -531,14 +553,20 @@ def main(cfg: StreamingSTTEvalConfig):
                 f.write(f"Segmentation: method={cfg.seg_method} max_segment_duration={cfg.max_segment_duration}s\n")
             f.write(f"WER: {wer:.2%} [ins={nins:.2%} del={ndel:.2%} sub={nsub:.2%}]\n")
             f.write(f"RTFx: {rtfx:.1f}\n")
-            for line in cpwer_lines:
-                f.write(line + "\n")
+            if cpwer_report:
+                f.write(cpwer_report + "\n")
             f.write(f"=============================================\n\n")
         run_block = _build_run_block(cfg, seg_mode=seg_mode)
         with SequentialJsonlWriter(cfg.output_manifest) as writer:
             for rec in reduced:
                 cpwer_result = cpwer_results.get(rec.id) if cpwer_results is not None else None
                 writer.write(_build_record(rec, normalizer, run_block, cpwer_result, content_score_mode))
+        if cpwer_metrics is not None:
+            metrics_path = Path(cfg.output_manifest).with_suffix(".metrics.json")
+            with open(metrics_path, "w") as handle:
+                json.dump(cpwer_metrics, handle, indent=1, sort_keys=True)
+                handle.write("\n")
+            logging.info(f"Wrote {metrics_path}")
 
 
 def _cut_meta(cut) -> dict:

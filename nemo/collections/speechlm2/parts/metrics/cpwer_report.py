@@ -73,6 +73,15 @@ def cpwer_metrics_dict(corpus: dict, subsets: dict, cfg: CpWERScoringConfig, *, 
         out[f"cpwer_{key}"] = corpus.get(f"cpwer_{key}_corpus", 0)
     out["cpwer_rows_without_subset"] = corpus.get("cpwer_rows_without_subset", 0)
 
+    # Stratification by REFERENCE speaker count -- orthogonal to the subset breakdown, and the
+    # cross-arm anchor recorded in every historical run log.
+    strata = {}
+    for key, value in corpus.items():
+        if key.endswith("spk") and key.startswith("cpwer_corpus_"):
+            strata[key[len("cpwer_corpus_") :]] = round(value * 100, 2) if scale == "percent" else value
+    if strata:
+        out["cpwer_by_num_speakers"] = strata
+
     per_subset = {}
     for name, block in subsets.items():
         entry = _rates(block, name, scale)
@@ -121,6 +130,10 @@ def format_cpwer_report(metrics: dict, cfg: CpWERScoringConfig, *, wer: Optional
             f"cpWER no-tag ceiling: {_pct(metrics['cpwer_notag_ceiling'])} "
             f"(a word-perfect but unattributed hypothesis) [source={cfg.cpwer_ceiling_source}]"
         )
+    for label, value in sorted(metrics.get("cpwer_by_num_speakers", {}).items()):
+        # Keep the literal words "reference speakers": a run script greps the log for them, and a
+        # more compact label would silently drop these lines from its filtered output.
+        lines.append(f"  {label:>5s} reference speakers: {_pct(value)}")
     for name, block in sorted(metrics.get("cpwer_per_subset", {}).items()):
         lines.append(f"  {name:<32s} {_pct(block.get('cpwer'))}  n={block.get('cpwer_sessions', 0)}")
     # Always printed, even at zero: a counter that appears only when non-zero cannot be told from
