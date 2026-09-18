@@ -14,9 +14,9 @@
 """Score a prediction manifest offline: cpWER and WER, no model, no GPU.
 
 `streaming_stt_generate.py` still scores inline by default. This exists so that CHANGING how
-scoring works does not mean re-running inference on a GPU -- which also would not be sound, since
-that script sets no seed and two runs of one checkpoint differ by more than most changes under test.
-Re-scoring a fixed manifest is exact; re-running is not.
+scoring works does not mean re-running inference on a GPU: scoring is CPU-only and takes seconds,
+inference takes a GPU and minutes. Re-running is reproducible (two runs at identical settings give
+byte-identical manifests), but re-scoring a fixed manifest is both exact and free.
 
 Requires the raw fields. A manifest written before those existed carries only `text` / `pred_text`,
 which were normalized AND tag-stripped before they were written, so re-normalizing them is not the

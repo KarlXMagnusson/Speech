@@ -30,10 +30,22 @@ Evaluation is split into inference and scoring:
    python examples/speechlm2/streaming_stt_score.py \
        manifest=eval/run.jsonl cpwer_normalizer=chime8
 
-The split exists because changing *how* scoring works should not mean re-running inference. It also
-would not be sound to do so: ``streaming_stt_generate.py`` sets no seed by default, so two runs of
-one checkpoint produce different hypotheses. Re-scoring a fixed manifest is exact; re-running is
-not. Any regression check should re-score an archived manifest rather than compare two runs.
+The split exists because changing *how* scoring works should not mean re-running inference: scoring
+is cheap and CPU-only, inference is neither.
+
+Re-running inference *is* reproducible. ``streaming_stt_generate.py`` sets no seed by default, but
+two runs of one checkpoint on one machine at identical settings produce byte-identical manifests.
+What changes a hypothesis is changing a **setting**, and ``batch_size`` counts: the chunked decoder
+pads every stream's response to the length of the slowest stream in its batch, so batch composition
+reaches the KV cache and moves the text. Compare runs only at equal settings, and prefer re-scoring
+an archived manifest, which is exact by construction.
+
+.. note::
+
+   Before the fix in ``cache_feature_bufferer.py`` that put its preprocessor in eval mode, this was
+   not true: dither was applied during inference and the same audio decoded differently every run.
+   Manifests produced before that fix are not reproducible, and numbers recorded from them cannot
+   be regenerated.
 
 Scoring inline and scoring offline produce identical numbers — both call the same code, and a test
 pins that.
@@ -158,17 +170,17 @@ Reading the report
 .. code-block:: text
 
    cpwer_axes: cpwer_ceiling_source='strip_tags',cpwer_drop_tag_residue=True,...
-   reference-comparable: no (3 of 9 comparable axes match)
+   reference-comparable: no (2 of 9 comparable axes match)
        differs: cpwer_normalizer='whisper' -> reference uses 'chime8'
-   WER: 25.01% [normalizer=whisper]
-   cpWER (micro): 30.33%
-   cpWER (macro): 31.13%
-   cpWER (subset-macro): 34.35%
+   WER: 24.95% [normalizer=whisper]
+   cpWER (micro): 30.24%
+   cpWER (macro): 31.04%
+   cpWER (subset-macro): 34.31%
    cpWER no-tag ceiling: 43.81% (a word-perfect but unattributed hypothesis) [source=strip_tags]
-      1spk reference speakers: 19.87%
-      4spk reference speakers: 44.25%
-     under20s-ami-ihm-test            25.53%  n=365
-     sessions 2912  admitted 2912  abstained 0  zero-ref-words 0  empty-hyp 2 ...
+      1spk reference speakers: 19.83%
+      4spk reference speakers: 45.73%
+     under20s-ami-ihm-test            25.88%  n=365
+     sessions 2912  admitted 2912  abstained 0  zero-ref-words 0  empty-hyp 2  untagged-hyp 82
 
 Three different averages appear, and they answer different questions:
 

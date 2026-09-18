@@ -62,6 +62,18 @@ def _bufferer(num_slots=1):
     )
 
 
+@pytest.fixture(autouse=True)
+def cpu_default_device():
+    """Force the default device to CPU for the whole file.
+
+    These tests are CPU-only by construction -- the bufferer is built with ``device=cpu``. Another
+    test in the wider suite leaves the process default device set to CUDA, which otherwise makes
+    these fail only when run after it, on tensors they never asked to put on a GPU.
+    """
+    with torch.device("cpu"):
+        yield
+
+
 def _audio(seed=0):
     generator = torch.Generator().manual_seed(seed)
     return torch.randn(int(SAMPLE_RATE * CHUNK_SECS), generator=generator)

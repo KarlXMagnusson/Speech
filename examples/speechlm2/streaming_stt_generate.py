@@ -284,7 +284,10 @@ def main(cfg: StreamingSTTEvalConfig):
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         torch.use_deterministic_algorithms(True)
     else:
-        logging.warning("Random seed not set, results will not be deterministic")
+        # Not a warning: greedy decoding on a fixed machine at fixed settings is already bit-exact,
+        # pinned by tests. `seed` additionally forces deterministic algorithms, which matters for
+        # sampling (`do_sample`) and for reproducing across hardware -- and costs throughput.
+        logging.info("Random seed not set; runs are still reproducible at identical settings.")
 
     model = StreamingSTTModel.from_pretrained(cfg.pretrained_name)
     model = model.eval().to(getattr(torch, cfg.dtype)).to(cfg.device)
