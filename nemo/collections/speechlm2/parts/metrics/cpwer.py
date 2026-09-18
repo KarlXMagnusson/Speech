@@ -136,8 +136,9 @@ class CpWER:
         """
         if normalizer is None:
             from nemo.collections.asr.parts.utils.text_normalizers import build_normalizer
+            from nemo.collections.speechlm2.parts.metrics.cpwer_scoring import resolve_normalizer
 
-            normalizer = build_normalizer(cfg.effective_normalizer(), cfg.normalizer_language)
+            normalizer = build_normalizer(resolve_normalizer(cfg), cfg.normalizer_language)
         return cls(
             normalize=True,
             normalizer=normalizer,

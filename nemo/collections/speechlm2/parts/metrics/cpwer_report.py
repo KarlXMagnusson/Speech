@@ -28,7 +28,7 @@ an axis added later reads as "at its default then" instead of invalidating the r
 
 from typing import Optional
 
-from nemo.collections.speechlm2.parts.metrics.cpwer_scoring import AXIS_FIELDS, CpWERScoringConfig
+from nemo.collections.speechlm2.parts.metrics.cpwer_scoring import AXIS_FIELDS, CpWERScoringConfig, resolve_normalizer
 
 __all__ = ["REFERENCE_AXES", "axis_fingerprint", "cpwer_metrics_dict", "format_cpwer_report"]
 
@@ -166,7 +166,7 @@ def axis_fingerprint(cfg: CpWERScoringConfig) -> dict:
         or ``"no"``), and ``non_axis`` for the settings that change a number without being axes.
     """
     resolved = {name: getattr(cfg, name) for name in AXIS_FIELDS}
-    resolved["cpwer_normalizer"] = cfg.effective_normalizer()
+    resolved["cpwer_normalizer"] = resolve_normalizer(cfg)
 
     deviations = []
     for name, expected in REFERENCE_AXES.items():

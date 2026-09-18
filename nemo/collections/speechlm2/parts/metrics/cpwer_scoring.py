@@ -108,7 +108,7 @@ class CpWERScoringConfig:
 
     def effective_normalizer(self) -> Optional[str]:
         """The normalizer cpWER will actually use, resolving the inherit-from-WER default."""
-        return self.cpwer_normalizer if self.cpwer_normalizer is not None else self.use_normalizer
+        return resolve_normalizer(self)
 
     def validate(self) -> None:
         """Check every string axis against its vocabulary.
@@ -127,6 +127,23 @@ class CpWERScoringConfig:
             value = getattr(self, name)
             if value not in accepted:
                 raise ValueError(f"Unknown {name}={value!r}. Accepted: {', '.join(map(repr, accepted))}")
+
+
+def resolve_normalizer(cfg) -> Optional[str]:
+    """The normalizer cpWER will actually use, resolving the inherit-from-WER default.
+
+    A free function rather than only a method because ``@hydra_runner`` hands every entry point a
+    ``DictConfig``, on which dataclass methods are not bound -- ``cfg.effective_normalizer()`` raises
+    ``ConfigAttributeError`` there. Reading fields works on either, so every internal caller uses
+    this and the surface accepts "any object carrying the config's fields", as documented.
+
+    Args:
+        cfg: a :class:`CpWERScoringConfig`, or any object with its fields (e.g. a ``DictConfig``).
+
+    Returns:
+        Optional[str]: ``cpwer_normalizer`` when set, otherwise ``use_normalizer``.
+    """
+    return cfg.cpwer_normalizer if cfg.cpwer_normalizer is not None else cfg.use_normalizer
 
 
 def score_rows(rows: list, cfg: CpWERScoringConfig, *, reference_field=None, hypothesis_field=None) -> tuple:

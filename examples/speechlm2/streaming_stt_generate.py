@@ -59,13 +59,14 @@ from lhotse.serialization import SequentialJsonlWriter
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from transformers import GenerationConfig
+
 from nemo.collections.asr.metrics.wer import word_error_rate_detail
 from nemo.collections.asr.parts.utils.sot_speaker_alignment import remove_speaker_tags
 from nemo.collections.asr.parts.utils.text_normalizers import build_normalizer
 from nemo.collections.common.data.lhotse.cutset import guess_parse_cutset
 from nemo.collections.common.data.lhotse.dataloader import pad_extra_duration
 from nemo.collections.speechlm2.models import StreamingSTTModel
-from nemo.collections.speechlm2.parts.metrics import CpWER, CpWERScoringConfig, CpWERSessionResult
+from nemo.collections.speechlm2.parts.metrics import CpWER, CpWERScoringConfig, CpWERSessionResult, resolve_normalizer
 from nemo.collections.speechlm2.parts.metrics.cpwer_report import cpwer_metrics_dict, format_cpwer_report
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
@@ -506,10 +507,16 @@ def main(cfg: StreamingSTTEvalConfig):
     cpwer_results = cpwer_metrics = None
     cpwer_report = ""
     if cfg.compute_cpwer and cfg.score_inline:
+        # cpWER gets its OWN normalizer. Reusing the WER one above silently ignored
+        # `cpwer_normalizer`, scoring with `use_normalizer` while the axis stamp still reported the
+        # requested family -- a wrong number rather than an error. They coincide only at the
+        # inherit-from-WER default.
+        cpwer_normalizer = build_normalizer(resolve_normalizer(cfg), cfg.normalizer_language)
+        logging.info(f"Using cpWER normalizer {resolve_normalizer(cfg)!r}")
         # Solve each session ONCE and feed the result to both the per-row dump and the accumulator.
         # Scoring per session and then calling update() re-solved every session, four Hungarian
         # solves per session with the ceiling on.
-        cpwer_metric = CpWER.from_config(cfg, normalizer=normalizer)
+        cpwer_metric = CpWER.from_config(cfg, normalizer=cpwer_normalizer)
         cpwer_results = {}
         for rec in reduced:
             cpwer_results[rec.id] = cpwer_metric.score_session(rec.ref_raw, rec.hyp_raw)
@@ -517,7 +524,7 @@ def main(cfg: StreamingSTTEvalConfig):
         corpus_summary = cpwer_metric.compute()
 
         # Per-subset buckets, keyed off the input manifest row carried in `meta`.
-        subset_metric = CpWER.from_config(cfg, normalizer=normalizer)
+        subset_metric = CpWER.from_config(cfg, normalizer=cpwer_normalizer)
         subsets_seen = set()
         for rec in reduced:
             subset = (rec.meta.get("custom") or {}).get(cfg.subset_field) or rec.meta.get(cfg.subset_field)
