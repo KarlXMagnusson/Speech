@@ -95,6 +95,13 @@ class BatchedCacheFeatureBufferer:
 
         self.preprocessor = ASRModel.from_config_dict(preprocessor_cfg)
         self.preprocessor.to(self.device)
+        # This preprocessor is built here rather than borrowed from the model, so it is not an
+        # nn.Module child of anything and a caller's `model.eval()` never reaches it. Left in the
+        # default training mode it would add dither on every call (`FilterbankFeatures.forward`
+        # gates on `self.training`), making inference non-deterministic: the same audio would
+        # decode to a different transcript each run. Set the mode rather than zeroing the config,
+        # so a caller that genuinely wants dither can still re-enable it with `.train()`.
+        self.preprocessor.eval()
 
         self.streamidx2slotidx, self.slotidx2streamidx = {}, {}
         self.available_slots = Queue(self.num_slots)
