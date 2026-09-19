@@ -2330,6 +2330,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         generation_config: Optional[GenerationConfig] = None,
         chunk_size: int = 1,
         inference_chunk_size: Optional[int] = None,
+        spk_targets: Optional[Tensor] = None,
         dynamic_min_chunk_size: int = 0,
         dynamic_max_chunk_size: Optional[int] = None,
         emit_threshold: Optional[float] = None,
@@ -2414,13 +2415,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         _initial_state = LISTENING if not self._user_header_ids else HEADER
         stream_state = [_initial_state] * B
         template_pos = [0] * B  # position within current template seq
-        audio_sample_idx = [0] * B  # next audio sample offset for perception
         gen_token_count = [0] * B  # tokens generated in current GENERATING phase
         last_gen_token = [self.text_pad_id] * B  # last generated token per stream
         all_tokens: list[list[int]] = [[] for _ in range(B)]
-
-        # Per-stream audio embedding buffer (filled by perception, consumed 1 at a time)
-        audio_emb_buf: list[list[Tensor]] = [[] for _ in range(B)]
 
         # Fixed-chunk mode: count frames consumed per segment to transition
         # after exactly chunk_size frames (ignoring model predictions).
@@ -2479,76 +2476,27 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         pad_token_id = self.blank_token_id if self.has_blank else self.text_pad_id
         pad_emb = self._embed_tokens(torch.tensor([pad_token_id], device=device)).squeeze(0)  # (H,)
 
+        # --- Encode ALL audio up front, at full batch ---
+        # Chunk boundaries are `k * chunk_samples` regardless of what the state machine does, the
+        # encoder is causal per row, and nothing flows back from the LLM into perception -- so a
+        # row's embeddings are the same whether they are computed lazily or all at once. Doing it
+        # eagerly keeps every perception call at batch B, which the mounted Sortformer requires:
+        # its spkcache grows with step count in sync mode and cannot be sliced to a subset.
+        audio_emb_buf = self._precompute_audio_embeddings(
+            audios=audios,
+            n_samples_list=n_samples_list,
+            state=state,
+            chunk_samples=chunk_samples,
+            frames_per_chunk=N,
+            device=device,
+            spk_targets=spk_targets,
+        )
+        # Every stream's audio has now been consumed, so the state machine's "audio exhausted"
+        # tests reduce to "this stream's queue is empty" -- which is what they already meant, since
+        # a LISTENING stream with audio remaining was always refilled before it could be read.
+        audio_sample_idx = list(n_samples_list)
+
         for _step in range(max_steps):
-            # --- Refill audio embedding buffers for LISTENING streams ---
-            needs_refill = [
-                b
-                for b in range(B)
-                if stream_state[b] == LISTENING
-                and len(audio_emb_buf[b]) == 0
-                and audio_sample_idx[b] < n_samples_list[b]
-            ]
-            if needs_refill:
-                # Run perception only for streams that need refill.
-                # The feature buffer selectively updates via stream_id.
-                # The encoder cache is sliced to the subset, then scattered back.
-                idx_t = torch.tensor(needs_refill, device=device)
-
-                # Build frames (only for refill streams)
-                frames = []
-                for b in needs_refill:
-                    start = audio_sample_idx[b]
-                    end = min(start + chunk_samples, n_samples_list[b])
-                    wav = audios[b, start:end]
-                    if wav.shape[0] < chunk_samples:
-                        wav = F.pad(wav, (0, chunk_samples - wav.shape[0]))
-                    frames.append(Frame(samples=wav, stream_id=b, length=end - start))
-                    audio_sample_idx[b] = end
-
-                # Feature buffer selectively updates only the submitted stream_ids
-                features, right_paddings = state.audio_feature_buffer.update(frames)
-                processed_signal = torch.stack(features).type_as(self._embed_ref_tensor)  # (S, D, T)
-                processed_signal_length = torch.tensor(
-                    [processed_signal.shape[-1] - int(rp) for rp in right_paddings],
-                    device=device,
-                ).long()
-
-                # Slice encoder cache to the subset (None when encoder is stateless).
-                if state.audio_cache.cache_last_channel is not None:
-                    sub_cache_lc = state.audio_cache.cache_last_channel.index_select(1, idx_t)
-                    sub_cache_lt = state.audio_cache.cache_last_time.index_select(1, idx_t)
-                    sub_cache_lcl = state.audio_cache.cache_last_channel_len[idx_t]
-                else:
-                    sub_cache_lc = sub_cache_lt = sub_cache_lcl = None
-
-                outputs = self.perception(
-                    processed_signal=processed_signal,
-                    processed_signal_length=processed_signal_length,
-                    cache_last_channel=sub_cache_lc,
-                    cache_last_time=sub_cache_lt,
-                    cache_last_channel_len=sub_cache_lcl,
-                    streaming=True,
-                )
-                batch_embs, _, new_cache = outputs
-
-                # Scatter updated cache back into the full B-sized cache
-                if new_cache is not None:
-                    for i, b in enumerate(needs_refill):
-                        state.audio_cache.cache_last_channel[:, b] = new_cache['cache_last_channel'][:, i]
-                        state.audio_cache.cache_last_time[:, b] = new_cache['cache_last_time'][:, i]
-                        state.audio_cache.cache_last_channel_len[b] = new_cache['cache_last_channel_len'][i]
-
-                # Distribute embeddings into per-stream buffers.
-                # Pad to exactly N frames (matching fast path's pad/trim behavior).
-                H_enc = batch_embs.shape[-1]
-                for i, b in enumerate(needs_refill):
-                    n_enc = batch_embs[i].shape[0]
-                    for f in range(n_enc):
-                        audio_emb_buf[b].append(batch_embs[i, f])
-                    # Pad with zeros if encoder returned fewer than N frames
-                    for _ in range(N - n_enc):
-                        audio_emb_buf[b].append(torch.zeros(H_enc, device=device, dtype=batch_embs.dtype))
-
             # --- Build (B, 1, H) input embeddings based on per-stream state ---
             # Each entry is (H,); we stack → (B, H) then unsqueeze → (B, 1, H).
             embs_list = []
@@ -3050,6 +2998,105 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         return result
 
+    def _precompute_audio_embeddings(
+        self,
+        audios: Tensor,
+        n_samples_list: list[int],
+        state,
+        chunk_samples: int,
+        frames_per_chunk: int,
+        device: torch.device,
+        spk_targets: Optional[Tensor] = None,
+    ) -> list[list[Tensor]]:
+        """Encode every stream's audio up front, at full batch, into per-stream frame queues.
+
+        The state machine then only reads from these queues, at its own per-stream pace. It never
+        triggers an encode, so perception and the diarizer never see a partial batch.
+
+        A stream whose audio is exhausted is still submitted, as a zero chunk of zero valid length
+        -- exactly what :meth:`_generate_chunked_streaming` does -- so the batch stays at ``B`` on
+        every call. That padding is inert: an exhausted row owns no frames in that chunk and never
+        encodes again, so the diarizer state it advances is never read. Padding a *live* row would
+        not be safe, and is why this encodes real audio rather than skipping absent rows.
+
+        Args:
+            audios: ``(B, T_samples)`` padded waveforms.
+            n_samples_list: ``B`` valid sample counts.
+            state: the streaming state; its ``audio_feature_buffer`` and ``audio_cache`` are
+                advanced in place.
+            chunk_samples: samples consumed per chunk, constant and independent of the decoder.
+            frames_per_chunk: encoder frames each chunk must yield; a short tail is zero-padded up
+                to this, matching the chunked path.
+            device: device for the padded chunks and padding frames.
+            spk_targets: optional ``(B, T_frames, n_spk)`` oracle targets on the encoder-frame grid.
+                Sliced per chunk, which is only well defined because every stream advances together.
+
+        Returns:
+            list[list[Tensor]]: per stream, its ``(H,)`` embedding frames in order. A stream's list
+            holds frames only for chunks its own audio reached.
+        """
+        B = len(n_samples_list)
+        audio_emb_buf: list[list[Tensor]] = [[] for _ in range(B)]
+        max_chunks = max((math.ceil(n / chunk_samples) if n > 0 else 0) for n in n_samples_list)
+
+        for chunk_i in range(max_chunks):
+            frames = []
+            for b in range(B):
+                start = chunk_i * chunk_samples
+                end = min(start + chunk_samples, n_samples_list[b])
+                if start >= n_samples_list[b]:
+                    # Exhausted: submitted only to keep the batch at B.
+                    wav = torch.zeros(chunk_samples, device=device, dtype=audios.dtype)
+                    valid = 0
+                else:
+                    wav = audios[b, start:end]
+                    if wav.shape[0] < chunk_samples:
+                        wav = F.pad(wav, (0, chunk_samples - wav.shape[0]))
+                    valid = end - start
+                frames.append(Frame(samples=wav, stream_id=b, length=valid))
+
+            features, right_paddings = state.audio_feature_buffer.update(frames)
+            processed_signal = torch.stack(features).type_as(self._embed_ref_tensor)  # (B, D, T)
+            processed_signal_length = torch.tensor(
+                [processed_signal.shape[-1] - int(rp) for rp in right_paddings],
+                device=device,
+            ).long()
+
+            extra = {}
+            if spk_targets is not None:
+                # `frames_per_chunk` is in encoder frames and the dataset builds `spk_targets` on
+                # that same grid, so this is a plain index window. A short final slice is fine:
+                # `_align_diar_frames` trims or pads it to the chunk's actual output width.
+                frame_start = chunk_i * frames_per_chunk
+                extra["spk_targets"] = spk_targets[:, frame_start : frame_start + frames_per_chunk]
+
+            batch_embs, _, new_cache = self.perception(
+                processed_signal=processed_signal,
+                processed_signal_length=processed_signal_length,
+                cache_last_channel=state.audio_cache.cache_last_channel,
+                cache_last_time=state.audio_cache.cache_last_time,
+                cache_last_channel_len=state.audio_cache.cache_last_channel_len,
+                streaming=True,
+                **extra,
+            )
+            # Whole-tensor assignment, not a per-row scatter: the batch is never a subset here.
+            if new_cache is not None:
+                state.audio_cache.cache_last_channel = new_cache['cache_last_channel']
+                state.audio_cache.cache_last_time = new_cache['cache_last_time']
+                state.audio_cache.cache_last_channel_len = new_cache['cache_last_channel_len']
+
+            hidden = batch_embs.shape[-1]
+            for b in range(B):
+                if chunk_i * chunk_samples >= n_samples_list[b]:
+                    continue  # padded row: it was encoded, but owns no frames in this chunk
+                produced = batch_embs[b].shape[0]
+                for f in range(produced):
+                    audio_emb_buf[b].append(batch_embs[b, f])
+                for _ in range(frames_per_chunk - produced):
+                    audio_emb_buf[b].append(torch.zeros(hidden, device=device, dtype=batch_embs.dtype))
+
+        return audio_emb_buf
+
     @staticmethod
     def _dynamic_finish_generating(
         b,
@@ -3304,13 +3351,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     **generation_kwargs,
                 )
             elif chunk_size == 0 or use_state_machine_inference:
-                if spk_targets is not None:
-                    raise NotImplementedError(
-                        "`spk_targets` are only threaded through the chunked streaming path. The "
-                        "dynamic/state-machine path steps a subset of streams per iteration, so a "
-                        "full-utterance target tensor cannot be sliced to match. Use "
-                        "use_state_machine_inference=false with chunk_size>0 for oracle-target eval."
-                    )
+                # `spk_targets` used to be refused here: the dynamic path stepped a SUBSET of
+                # streams per refill, so a full-utterance target tensor had no slice that matched.
+                # Eager precompute advances every stream together on a fixed `k * chunk_samples`
+                # grid, so the same frame-index window the chunked path uses now applies unchanged.
                 # Dynamic chunking (chunk_size=0) or state machine inference opted in for chunk_size > 0.
                 # Note that for chunk_size > 0, use_state_machine_inference is not recommended.
                 result = self._generate_dynamic_streaming(
@@ -3320,6 +3364,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     max_new_tokens,
                     generation_config,
                     chunk_size=chunk_size,
+                    spk_targets=spk_targets,
                     dynamic_min_chunk_size=dynamic_min_chunk_size,
                     dynamic_max_chunk_size=dynamic_max_chunk_size,
                     emit_threshold=emit_threshold,

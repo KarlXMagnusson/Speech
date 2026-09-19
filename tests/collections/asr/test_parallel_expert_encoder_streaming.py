@@ -268,3 +268,41 @@ def test_subset_stepping_reports_the_batch_mismatch_clearly():
                 cache_last_channel_len=cache_last_channel_len[subset],
                 keep_all_outputs=False,
             )
+
+
+@pytest.mark.unit
+def test_an_empty_diarizer_step_is_named_not_left_to_the_fusion():
+    """A chunk too short for the diarizer must fail here, with the cause in the message.
+
+    ``_align_diar_frames`` pads by repeating the last frame, and repeating a zero-width tensor
+    gives another zero-width tensor. Without this guard an empty diarizer step would flow into
+    ``_fuse_diar_and_asr`` and surface as a shape mismatch deep in the fusion, naming neither the
+    diarizer nor the chunk size that caused it.
+
+    Unreachable in every measured configuration -- the diarizer and the ASR branch agree
+    frame-for-frame -- which is exactly when a guard is cheap to add and cheap to keep.
+    """
+    enc = build_toy_streaming_pe_encoder().eval()
+    enc.setup_streaming_params()
+    chunk_size = enc.streaming_cfg.chunk_size
+    chunk_size = chunk_size[1] if isinstance(chunk_size, (list, tuple)) else chunk_size
+    batch = 2
+    cache_last_channel, cache_last_time, cache_last_channel_len = enc.get_initial_cache_state(
+        batch_size=batch, dtype=torch.float32, device=torch.device("cpu")
+    )
+
+    # Make the diarizer return without adding frames, which is what a too-short chunk does.
+    def _no_new_frames(processed_signal, processed_signal_length, streaming_state, total_preds, **kwargs):
+        return streaming_state, total_preds
+
+    enc.diarization_model.forward_streaming_step = _no_new_frames
+
+    with pytest.raises(RuntimeError, match="produced no new frames"), torch.no_grad():
+        enc.cache_aware_stream_step(
+            processed_signal=torch.randn(batch, _MEL_FEATURES, chunk_size),
+            processed_signal_length=torch.tensor([chunk_size] * batch),
+            cache_last_channel=cache_last_channel,
+            cache_last_time=cache_last_time,
+            cache_last_channel_len=cache_last_channel_len,
+            keep_all_outputs=False,
+        )

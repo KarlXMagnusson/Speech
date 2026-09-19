@@ -1186,6 +1186,26 @@ class StreamingParallelExpertEncoder(ParallelExpertEncoder, StreamingEncoder):
                 **step_kwargs,
             )
         new_preds = self._diar_total_preds[:, prev_len:]
+        # Fail here rather than downstream. `_align_diar_frames` pads-by-repeat, and repeating a
+        # zero-width tensor yields another zero-width tensor -- so an empty diarizer step would
+        # propagate silently into `_fuse_diar_and_asr` and surface as a shape error deep in the
+        # fusion, naming neither the diarizer nor the chunk that produced nothing. Not currently
+        # reachable: the diarizer emits exactly as many frames as the ASR branch in every measured
+        # configuration, which is precisely why this is cheap to assert.
+        if new_preds.shape[1] == 0:
+            raise RuntimeError(
+                f"The diarizer produced no new frames for a chunk of {processed_signal.shape[-1]} "
+                f"mel frames (valid lengths {processed_signal_length.tolist()}, "
+                f"drop_extra_pre_encoded={drop_extra_pre_encoded}). Its feature stacking consumed "
+                "the whole chunk, so there is nothing to align to the ASR branch's "
+                f"{align_target} frames. Use a larger `inference_chunk_size`."
+            )
+        if align_target <= 0:
+            raise RuntimeError(
+                f"The ASR branch produced {align_target} frames for this chunk, so there is no "
+                "target width to align the diarizer's predictions to. This means the chunk was "
+                "consumed entirely by the pre-encode cache; use a larger `inference_chunk_size`."
+            )
         return self._align_diar_frames(new_preds, align_target)
 
 

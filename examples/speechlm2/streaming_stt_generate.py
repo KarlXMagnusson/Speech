@@ -97,6 +97,41 @@ class ToAudio(torch.utils.data.Dataset):
         return {"cuts": cuts, "audios": audios, "audio_lens": audio_lens}
 
 
+def _oracle_targets(cfg, batch: dict, device) -> dict:
+    """Resolve oracle speaker targets for one batch, or refuse if they were asked for and absent.
+
+    `oracle_spk_targets` used to degrade silently: `ToAudio` yields only audio, so `spk_targets`
+    was never on a batch, the flag did nothing, and the run still stamped `oracle_spk_targets: true`
+    into the manifest. A four-arm eval comparing oracle against the embedded diarizer therefore
+    produced two pairs of byte-identical arms -- 0 of 600 hypotheses differing -- which reads as
+    "the diarizer is already as good as oracle" rather than as "the targets were never applied".
+
+    Args:
+        cfg: the eval config; only ``oracle_spk_targets`` is consulted.
+        batch: one dataloader batch.
+        device: where to move the targets.
+
+    Returns:
+        dict: ``{"spk_targets": Tensor}`` when oracle targets are requested and present, else ``{}``.
+
+    Raises:
+        ValueError: when oracle targets are requested but the batch carries none.
+    """
+    if not cfg.oracle_spk_targets:
+        return {}
+    targets = batch.get("spk_targets")
+    if targets is None:
+        raise ValueError(
+            "oracle_spk_targets=true, but this batch carries no `spk_targets`. This script's "
+            "dataloader (`ToAudio`) loads audio only, so RTTM-derived targets are never collated "
+            "-- the flag would otherwise be silently ignored while the embedded diarizer ran and "
+            "the manifest still recorded `oracle_spk_targets: true`. Feeding oracle targets needs "
+            "a dataloader that emits them (see `StreamingSTTDataset`, which builds them when its "
+            "multi-speaker config is enabled). Until then, set oracle_spk_targets=false."
+        )
+    return {"spk_targets": targets.to(device, non_blocking=True)}
+
+
 def compute_segment_spans(cut, max_segment_duration: float, method: str = "fixed") -> list[tuple[float, float]]:
     """Compute (offset, duration) spans (seconds) tiling one recording for segmentation.
 
@@ -241,7 +276,7 @@ class StreamingSTTEvalConfig(CpWERScoringConfig):
     # Feed ORACLE RTTM speaker targets to the encoder at inference instead of letting a
     # ParallelExpertEncoder run its own streaming diarizer. Separates "does the speaker kernel
     # help" from "is the streaming diarizer good enough" -- a weak infusion result is otherwise
-    # ambiguous between the two. Needs spk_targets on the batch and the chunked path.
+    # ambiguous between the two. Needs spk_targets on the batch; runs on either decoder.
     oracle_spk_targets: bool = False
     # --- Long-form segmentation -------------------------------------------
     # When ``max_segment_duration`` is set (> 0), each input recording is split into
@@ -306,13 +341,6 @@ def main(cfg: StreamingSTTEvalConfig):
     # recording id -> its ordered segments; ``seg_start_by_id`` gives per-segment
     # start offsets (used to globalize per-word alignment timestamps).
     seg_mode = cfg.max_segment_duration is not None and cfg.max_segment_duration > 0
-    if cfg.oracle_spk_targets and cfg.use_state_machine_inference:
-        raise ValueError(
-            "oracle_spk_targets requires the chunked path: the dynamic/state-machine path steps a "
-            "subset of streams per iteration, so a full-utterance target tensor cannot be sliced to "
-            "match. Set use_state_machine_inference=false."
-        )
-
     # Gated, not deleted. Segmented inference may now WRITE a manifest, since scoring can happen
     # later; what is still impossible is scoring cpWER over it, here or offline. The scorer raises
     # the same message from `_run.seg_mode`.
@@ -396,11 +424,7 @@ def main(cfg: StreamingSTTEvalConfig):
             chunk_size_override=cfg.chunk_size_override,
             return_alignments=cfg.save_alignments,
             return_debug_logs=cfg.debug_log_audio_frames,
-            **(
-                {"spk_targets": batch["spk_targets"].to(model.device, non_blocking=True)}
-                if cfg.oracle_spk_targets and batch.get("spk_targets") is not None
-                else {}
-            ),
+            **_oracle_targets(cfg, batch, model.device),
         )
         batch_infer_duration = perf_counter() - ts
 
